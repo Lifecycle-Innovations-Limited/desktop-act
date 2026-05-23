@@ -3,10 +3,19 @@
 > Computer-use primitives + multi-desktop pool + autonomous `act()` loop for
 > Claude Code. One MCP server, no API key.
 
-`desktop-act` lets Claude (or any MCP client) drive an X11 desktop:
-screenshot it, click, type, scroll, launch apps, run a goal-driven loop. It
-ships a pooled VNC backend so you can spin up isolated desktops on demand, each
-streamed over noVNC for live viewing.
+`desktop-act` lets Claude (or any MCP client) drive a desktop: screenshot it,
+click, type, scroll, launch apps, run a goal-driven loop. It is **OS-agnostic** —
+a backend is selected at startup from `platform.system()`:
+
+- **Linux (`X11Backend`):** python-xlib primitives + a pooled Xvnc/websockify
+  backend so you can spin up isolated desktops on demand, each streamed over
+  noVNC for live viewing.
+- **macOS (`MacBackend`):** `screencapture` for frames, `cliclick`/`osascript`
+  for input, and the single real logged-in session (no Xvnc pool). Built-in
+  Screen Sharing (VNC :5900) is bridged to noVNC via `websockify` when enabled.
+
+All tool signatures and return shapes are identical across backends, so callers
+never need to know which platform they're on.
 
 Auth path is **Claude CLI OAuth via `claude-agent-sdk`** — costs ride on a
 Claude Max subscription, no `ANTHROPIC_API_KEY` needed.
@@ -41,6 +50,8 @@ The first invocation auto-bootstraps a Python venv at `${CLAUDE_PLUGIN_ROOT}/.ve
 
 ### System dependencies
 
+#### Linux (X11Backend)
+
 You need an X11 stack and a VNC server reachable as `Xvnc` (TigerVNC):
 
 ```bash
@@ -53,6 +64,30 @@ sudo apt install -y tigervnc-standalone-server websockify metacity xterm python3
 
 Optional but recommended: `openbox`, `xdotool`, `firefox`, `nautilus`,
 `libreoffice` (whatever GUI apps you want to drive).
+
+#### macOS (MacBackend)
+
+Input is driven by [`cliclick`](https://github.com/BlueM/cliclick); everything
+else (`screencapture`, `osascript`, `open`) is built into macOS.
+
+```bash
+brew install cliclick
+# Optional — for a live noVNC view bridged off built-in Screen Sharing:
+brew install websockify   # (or: pip install websockify)
+```
+
+**Required macOS permissions** (System Settings → Privacy & Security):
+
+- **Screen Recording** — for `screenshot`/`observe`/`act_step` (the
+  `screencapture` capture path). Without it, captures fail with
+  `could not create image from display`.
+- **Accessibility** — for `click`/`type_text`/`keypress`/`scroll` (the
+  `cliclick` and System Events input path).
+
+Grant both to the host process driving the MCP server (your terminal, Claude
+Code, etc.). For a live view, optionally enable **Screen Sharing** (System
+Settings → General → Sharing → Screen Sharing); `acquire_desktop` still returns
+a session without it and surfaces a `vnc_hint`.
 
 ---
 
@@ -137,6 +172,12 @@ http://<box-host>:6083   # second, etc.
 
 ## Architecture notes
 
+- **OS-agnostic backend.** A module-level `BACKEND` is chosen at startup from
+  `platform.system()` — `MacBackend` on macOS, `X11Backend` everywhere else.
+  Both implement the same `Backend` protocol; every `@mcp.tool` simply delegates
+  to `BACKEND.<method>`, so tool signatures and return shapes are identical
+  across platforms. `from Xlib import …` is imported lazily inside the X11
+  methods, so the module imports cleanly on macOS without python-xlib installed.
 - **Persistent X11 connections.** One `Xlib.Display` per display name, cached
   for the life of the MCP process. Saves the connection-establishment hit per
   primitive call.
