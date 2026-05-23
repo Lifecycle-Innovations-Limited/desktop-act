@@ -1,6 +1,6 @@
 {
   "name": "desktop-act",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Single 'do what I mean' entrypoint for agentic browsing + desktop automation. Wraps Kapture, claude-in-chrome, chrome-devtools-mcp, Playwright, patchright, and python-xlib behind one LLM-routed tool.",
   "author": {
     "name": "Sam Renders"
