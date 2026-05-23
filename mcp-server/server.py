@@ -66,6 +66,23 @@ MAC_SESSION_ID: str = "mac-main"
 MAC_DISPLAY: str = "mac:main"
 MAC_VNC_PORT: int = int(os.environ.get("DESKTOP_ACT_MAC_VNC_PORT", "5900"))
 MAC_NOVNC_PORT: int = int(os.environ.get("DESKTOP_ACT_MAC_NOVNC_PORT", "6080"))
+# The macOS system-framework Python always ships Quartz/pyobjc, which the venv
+# (requirements.txt) does not. We shell out to it to synthesize scroll-wheel
+# CGEvents — AppleScript has no working scroll verb.
+MAC_SYSTEM_PYTHON: str = os.environ.get("DESKTOP_ACT_MAC_PYTHON", "/usr/bin/python3")
+# Posts `amount` line-unit scroll-wheel events. argv: <dy> <dx>.
+_MAC_SCROLL_PY = (
+    "import sys\n"
+    "from Quartz import (CGEventCreateScrollWheelEvent, CGEventPost, "
+    "kCGHIDEventTap, kCGScrollEventUnitLine)\n"
+    "dy, dx = int(sys.argv[1]), int(sys.argv[2])\n"
+    "n = max(abs(dy), abs(dx)) or 1\n"
+    "sy = (1 if dy > 0 else -1) if dy else 0\n"
+    "sx = (1 if dx > 0 else -1) if dx else 0\n"
+    "for _ in range(n):\n"
+    "    ev = CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitLine, 2, sy, sx)\n"
+    "    CGEventPost(kCGHIDEventTap, ev)\n"
+)
 # Locate `claude` CLI: env override → PATH lookup → ~/.local/bin → ~/.claude/local.
 _claude_default = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
 CLAUDE_CLI = Path(os.environ.get("CLAUDE_CLI_PATH", _claude_default))
@@ -648,12 +665,15 @@ class X11Backend:
             _write_pool(pool)
             return {"ok": True, "released": session_id, "killed": killed}
 
+    @staticmethod
+    def _session_alive(sess: dict) -> bool:
+        return _pid_alive(sess.get("xvnc_pid", 0))
+
     async def list_desktops(self) -> dict:
         pool = _read_pool()
         sessions = []
         for _sid, s in pool.items():
-            alive = _pid_alive(s.get("xvnc_pid", 0))
-            sessions.append({**s, "alive": alive})
+            sessions.append({**s, "alive": self._session_alive(s)})
         return {"ok": True, "count": len(sessions), "sessions": sessions}
 
 
@@ -670,22 +690,24 @@ class MacBackend:
 
     name = "mac"
 
-    # button 1/2/3 → cliclick click-type prefixes (left, right, right; macOS has no middle).
-    _BTN = {1: "c", 2: "rc", 3: "rc"}
+    # button → (single-click verb, double-click verb). macOS/cliclick has no
+    # native middle-click, so button=2 is reported as unsupported rather than
+    # silently mis-mapped to a right-click. button 4/5 are scroll, handled in click().
+    _BTN = {1: ("c", "dc"), 3: ("rc", "rc")}
 
     def __init__(self) -> None:
         self._bridge_pid: Optional[int] = None
 
     # ── helpers ───────────────────────────────────────────────────────────
     def _resolve_display(self, session_id: str = "") -> str:
-        """macOS has one display. Any non-matching session_id is rejected like X11."""
+        """macOS has exactly one session. Empty or MAC_SESSION_ID → the real display;
+        any other id is rejected (there is no pool to look it up in)."""
         if not session_id or session_id == MAC_SESSION_ID:
             return MAC_DISPLAY
-        pool = _read_pool()
-        sess = pool.get(session_id)
-        if not sess:
-            raise ValueError(f"unknown session_id: {session_id}")
-        return sess["display"]
+        raise ValueError(
+            f"unknown session_id: {session_id} "
+            f"(macOS has a single session: {MAC_SESSION_ID!r})"
+        )
 
     async def _run(self, *argv: str) -> tuple[int, str, str]:
         """Run a system binary directly (no shell), return (rc, stdout, stderr)."""
@@ -746,8 +768,24 @@ class MacBackend:
             return await self.scroll(
                 "up" if button == 4 else "down", 1, x, y, session_id
             )
-        prefix = "dc" if double else self._BTN.get(button, "c")
-        rc, _out, err = await self._run(cc, f"{prefix}:{x},{y}")
+        verbs = self._BTN.get(button)
+        if verbs is None:
+            return {
+                "ok": False,
+                "error": f"button {button} unsupported on macOS "
+                "(no middle-click; use 1=left or 3=right)",
+                "x": x,
+                "y": y,
+                "button": button,
+                "double": double,
+                "display": display,
+            }
+        # cliclick has no double-right verb, so synthesize it with two right-clicks.
+        if double and button == 3:
+            rc, _out, err = await self._run(cc, f"rc:{x},{y}", f"rc:{x},{y}")
+        else:
+            prefix = verbs[1] if double else verbs[0]
+            rc, _out, err = await self._run(cc, f"{prefix}:{x},{y}")
         if rc != 0:
             raise RuntimeError(f"cliclick failed (rc={rc}): {err.strip()}")
         return {
@@ -827,27 +865,30 @@ class MacBackend:
 
     async def scroll(self, direction, amount, x, y, session_id) -> dict:
         display = self._resolve_display(session_id)
-        cc = self._cliclick()
-        if x >= 0 and y >= 0:
-            await self._run(cc, f"m:{x},{y}")
-        # System Events scroll: {deltaX, deltaY} units (1 "click" ≈ 3 lines).
+        # Optionally warp the pointer first (cliclick m:) so the scroll lands there.
+        if x >= 0 and y >= 0 and BIN["cliclick"]:
+            await self._run(BIN["cliclick"], f"m:{x},{y}")
+        # Synthesize line-unit scroll-wheel CGEvents. AppleScript "System Events"
+        # has no working `scroll` verb (errors -1708), so post the event via the
+        # macOS system framework Python (always ships Quartz/pyobjc) — no new dep.
+        # Wheel deltas: +y scrolls up, +x scrolls left.
         d = direction.lower()
-        dx, dy = 0, 0
-        per = 3
+        dy = dx = 0
         if d == "up":
-            dy = per * amount
+            dy = amount
         elif d == "down":
-            dy = -per * amount
+            dy = -amount
         elif d == "left":
-            dx = per * amount
+            dx = amount
         elif d == "right":
-            dx = -per * amount
+            dx = -amount
         else:
-            dy = -per * amount
-        script = f'tell application "System Events" to scroll {{{dx}, {dy}}}'
-        rc, _out, err = await self._run(BIN["osascript"] or "osascript", "-e", script)
+            dy = -amount
+        rc, _out, err = await self._run(
+            MAC_SYSTEM_PYTHON, "-c", _MAC_SCROLL_PY, str(dy), str(dx)
+        )
         if rc != 0:
-            raise RuntimeError(f"osascript scroll failed (rc={rc}): {err.strip()}")
+            raise RuntimeError(f"scroll failed (rc={rc}): {err.strip()}")
         return {
             "ok": True,
             "direction": direction,
@@ -985,13 +1026,27 @@ class MacBackend:
             **bridge,
         }
 
+    @staticmethod
+    def _session_alive(sess: dict) -> bool:
+        """A mac session is live iff its real display is up (VNC reachable) — or, when
+        Screen Sharing is off, the bridge port we recorded for it. Falls back to the
+        VNC port for the canonical session."""
+        if sess.get("session_id") == MAC_SESSION_ID:
+            return _port_open(MAC_VNC_PORT)
+        ws = sess.get("websockify_pid")
+        if ws:
+            return _pid_alive(ws)
+        return False
+
     async def acquire_desktop(self, geometry) -> dict:
         # macOS: one real session. Persist a stable record; bridge VNC best-effort.
         bridge = await self._start_bridge()
         session = self._session_record(geometry, bridge)
         with _PoolLock():
             pool = _read_pool()
-            pool[MAC_SESSION_ID] = session
+            # Pool hygiene: the shared /tmp pool may carry stale X11 (desk-*) entries
+            # from a prior boot/OS. On mac, the pool must contain only mac-main.
+            pool = {MAC_SESSION_ID: session}
             _write_pool(pool)
         return {"ok": True, **session}
 
@@ -1022,12 +1077,13 @@ class MacBackend:
             }
 
     async def list_desktops(self) -> dict:
+        # Only ever surface the single mac session; drop any stale X11 entries.
         pool = _read_pool()
         sessions = []
         for _sid, s in pool.items():
-            # Session is alive iff the real display/VNC is up.
-            alive = _port_open(MAC_VNC_PORT)
-            sessions.append({**s, "alive": alive})
+            if s.get("session_id") != MAC_SESSION_ID:
+                continue
+            sessions.append({**s, "alive": self._session_alive(s)})
         return {"ok": True, "count": len(sessions), "sessions": sessions}
 
 
@@ -1473,11 +1529,12 @@ async def status() -> dict:
                 "display": s["display"],
                 "novnc_url": s.get("novnc_url"),
                 "geometry": s["geometry"],
-                "alive": _port_open(MAC_VNC_PORT)
-                if IS_MAC
-                else _pid_alive(s.get("xvnc_pid", 0)),
+                # Per-session liveness via the active backend (not a blanket probe).
+                "alive": BACKEND._session_alive(s),  # type: ignore[attr-defined]
             }
             for s in pool.values()
+            # On mac, only surface the canonical session — never stale X11 rows.
+            if not IS_MAC or s.get("session_id") == MAC_SESSION_ID
         ],
         "display_range": "mac:main (single session)"
         if IS_MAC
