@@ -1,0 +1,20 @@
+{
+  "name": "desktop-act",
+  "version": "0.1.0",
+  "description": "Single 'do what I mean' entrypoint for agentic browsing + desktop automation. Wraps Kapture, claude-in-chrome, chrome-devtools-mcp, Playwright, patchright, and python-xlib behind one LLM-routed tool.",
+  "author": {
+    "name": "Sam Renders"
+  },
+  "skills": [
+    "skills/desktop-act"
+  ],
+  "commands": [
+    "commands/act.md"
+  ],
+  "mcpServers": {
+    "desktop-act": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/mcp-server/run.sh"
+    }
+  }
+}
