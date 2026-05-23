@@ -744,7 +744,7 @@ class MacBackend:
         # 4/5 scroll buttons → delegate to scroll for X11 parity.
         if button in (4, 5):
             return await self.scroll(
-                "up" if button == 4 else "down", 3, x, y, session_id
+                "up" if button == 4 else "down", 1, x, y, session_id
             )
         prefix = "dc" if double else self._BTN.get(button, "c")
         rc, _out, err = await self._run(cc, f"{prefix}:{x},{y}")
