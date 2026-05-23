@@ -1059,12 +1059,21 @@ class MacBackend:
                 return {"ok": False, "error": f"unknown session_id: {session_id}"}
             killed: list[dict] = []
             pid = sess.get("websockify_pid") or self._bridge_pid
+            did_term = False
             if pid and _pid_alive(pid):
                 try:
                     os.kill(pid, signal.SIGTERM)
                     killed.append({"websockify_pid": pid})
+                    did_term = True
                 except OSError:
                     pass
+            if did_term:
+                await asyncio.sleep(0.3)
+                if pid and _pid_alive(pid):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
             self._bridge_pid = None
             _LAST_SHOT.pop(sess["display"], None)
             pool.pop(session_id, None)
