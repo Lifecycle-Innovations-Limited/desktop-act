@@ -305,6 +305,33 @@ class Backend(Protocol):
 
 
 # ─── X11 backend (Linux) ─────────────────────────────────────────────────────
+# ASCII printable -> X11 keysym name. python-xlib's XK.string_to_keysym() needs the
+# keysym name, not the literal character, so e.g. string_to_keysym("@") returns 0
+# but string_to_keysym("at") returns the right keysym. Without this map, typing
+# strings containing punctuation silently drops the offending characters.
+_CHAR_TO_KEYSYM_NAME: dict[str, str] = {
+    " ": "space", "\n": "Return", "\t": "Tab",
+    "!": "exclam", "\"": "quotedbl", "#": "numbersign", "$": "dollar",
+    "%": "percent", "&": "ampersand", "'": "apostrophe", "(": "parenleft",
+    ")": "parenright", "*": "asterisk", "+": "plus", ",": "comma",
+    "-": "minus", ".": "period", "/": "slash", ":": "colon", ";": "semicolon",
+    "<": "less", "=": "equal", ">": "greater", "?": "question", "@": "at",
+    "[": "bracketleft", "\\": "backslash", "]": "bracketright",
+    "^": "asciicircum", "_": "underscore", "`": "grave",
+    "{": "braceleft", "|": "bar", "}": "braceright", "~": "asciitilde",
+}
+
+# Keysym NAMES that live at the shifted level on a US PC layout — when the caller
+# does `keypress("at")` we must hold Shift, otherwise fake_input sends the base
+# keycode for "2" and the wrong character lands in the focused widget.
+_SHIFT_REQUIRED_KEYSYMS: frozenset[str] = frozenset({
+    "exclam", "at", "numbersign", "dollar", "percent", "asciicircum",
+    "ampersand", "asterisk", "parenleft", "parenright", "underscore",
+    "plus", "braceleft", "braceright", "bar", "colon", "quotedbl",
+    "less", "greater", "question", "asciitilde",
+})
+
+
 class X11Backend:
     """X11/Xvnc backend. Behavior is byte-for-byte identical to the original server."""
 
@@ -398,9 +425,8 @@ class X11Backend:
         d = self._get_display(display)
         shift_kc = d.keysym_to_keycode(XK.XK_Shift_L)
         for ch in text:
-            ks = XK.string_to_keysym(ch) or XK.string_to_keysym(
-                {" ": "space", "\n": "Return", "\t": "Tab"}.get(ch, ch)
-            )
+            name = _CHAR_TO_KEYSYM_NAME.get(ch, ch)
+            ks = XK.string_to_keysym(name)
             if not ks:
                 continue
             kc = d.keysym_to_keycode(ks)
@@ -422,7 +448,14 @@ class X11Backend:
 
         display = self._resolve_display(session_id)
         d = self._get_display(display)
-        mods = modifiers or []
+        mods = list(modifiers or [])
+        # Auto-add Shift when the requested keysym sits at the shifted level of
+        # its keycode (e.g. "at", "exclam", "question"); without this, fake_input
+        # sends the base keycode and types "2", "1", "/" instead.
+        if key in _SHIFT_REQUIRED_KEYSYMS and not any(
+            m.lower() == "shift" for m in mods
+        ):
+            mods.append("Shift")
         mcodes = [d.keysym_to_keycode(XK.string_to_keysym(m + "_L")) for m in mods]
         kc = d.keysym_to_keycode(XK.string_to_keysym(key))
         for m in mcodes:
