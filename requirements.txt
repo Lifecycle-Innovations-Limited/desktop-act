@@ -12,4 +12,4 @@ pydantic-settings==2.14.2
 pydantic_core==2.46.4
 # Linux-only: X11 primitives. On macOS the MacBackend uses system binaries
 # (screencapture, cliclick, osascript, open) and never imports Xlib.
-python-xlib==0.33; sys_platform != "darwin"
+python-xlib==0.33; sys_platform == "linux"

@@ -25,6 +25,7 @@ Examples::
   desktop-act call list_windows --arg session_id=SID
   desktop-act release --session-id SID
 """
+
 from __future__ import annotations
 
 import argparse
@@ -37,8 +38,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 # ─── discovery ───────────────────────────────────────────────────────────────
+
 
 def _cache_src() -> Path:
     system = platform.system().lower()
@@ -98,6 +99,7 @@ def resolve_server_cmd() -> list[str]:
 
 
 # ─── MCP client ──────────────────────────────────────────────────────────────
+
 
 class McpClient:
     """Minimal JSON-RPC-over-stdio MCP client (initialize + tools/call)."""
@@ -190,7 +192,9 @@ def unwrap_tool_result(result: Any) -> Any:
         return result["structuredContent"]
     content = result.get("content")
     if isinstance(content, list) and content:
-        texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+        texts = [
+            c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"
+        ]
         joined = "\n".join(t for t in texts if t)
         if joined.strip().startswith("{") or joined.strip().startswith("["):
             try:
@@ -214,12 +218,20 @@ def emit(data: Any) -> None:
 
 # ─── commands ────────────────────────────────────────────────────────────────
 
+
 def _client_from_args(args: argparse.Namespace) -> McpClient:
     cmd = resolve_server_cmd()
     env: dict[str, str] = {}
     if getattr(args, "display", None):
         env["DISPLAY"] = args.display
         env.setdefault("DESKTOP_ACT_DISPLAY", args.display)
+    # CLI is short-lived; do not free pool desktops when the stdio server exits.
+    # Long-lived MCP hosts keep default RELEASE_ON_EXIT=1.
+    env.setdefault("DESKTOP_ACT_RELEASE_ON_EXIT", "0")
+    if getattr(args, "owner_id", None):
+        env.setdefault("DESKTOP_ACT_OWNER", args.owner_id)
+    if getattr(args, "geometry", None):
+        env.setdefault("DESKTOP_ACT_GEOMETRY", args.geometry)
     timeout = float(getattr(args, "rpc_timeout", 120) or 120)
     client = McpClient(cmd, env=env or None, timeout=timeout)
     try:
@@ -251,7 +263,56 @@ def cmd_list(args: argparse.Namespace) -> int:
 def cmd_acquire(args: argparse.Namespace) -> int:
     client = _client_from_args(args)
     try:
-        out = unwrap_tool_result(client.call_tool("acquire_desktop", {}))
+        params: dict[str, Any] = {}
+        if getattr(args, "geometry", None):
+            params["geometry"] = args.geometry
+        if getattr(args, "owner_id", None):
+            params["owner_id"] = args.owner_id
+        if getattr(args, "force_new", False):
+            params["force_new"] = True
+        out = unwrap_tool_result(client.call_tool("acquire_desktop", params))
+        emit(out)
+        return 0
+    finally:
+        client.close()
+
+
+def cmd_ensure(args: argparse.Namespace) -> int:
+    """Multi-agent entry: reuse own lease or auto-spawn if busy."""
+    client = _client_from_args(args)
+    try:
+        params: dict[str, Any] = {}
+        if getattr(args, "geometry", None):
+            params["geometry"] = args.geometry
+        if getattr(args, "owner_id", None):
+            params["owner_id"] = args.owner_id
+        out = unwrap_tool_result(client.call_tool("ensure_desktop", params))
+        emit(out)
+        return 0 if not (isinstance(out, dict) and out.get("ok") is False) else 1
+    finally:
+        client.close()
+
+
+def cmd_heartbeat(args: argparse.Namespace) -> int:
+    if not args.session_id:
+        print("error: --session-id required", file=sys.stderr)
+        return 2
+    client = _client_from_args(args)
+    try:
+        params: dict[str, Any] = {"session_id": args.session_id}
+        if getattr(args, "owner_id", None):
+            params["owner_id"] = args.owner_id
+        out = unwrap_tool_result(client.call_tool("heartbeat_desktop", params))
+        emit(out)
+        return 0 if not (isinstance(out, dict) and out.get("ok") is False) else 1
+    finally:
+        client.close()
+
+
+def cmd_reap(args: argparse.Namespace) -> int:
+    client = _client_from_args(args)
+    try:
+        out = unwrap_tool_result(client.call_tool("reap_idle_desktops", {}))
         emit(out)
         return 0
     finally:
@@ -264,7 +325,9 @@ def cmd_release(args: argparse.Namespace) -> int:
         return 2
     client = _client_from_args(args)
     try:
-        emit(unwrap_tool_result(client.call_tool("release_desktop", {"session_id": args.session_id})))
+        emit(
+            unwrap_tool_result(client.call_tool("release_desktop", {"session_id": args.session_id}))
+        )
         return 0
     finally:
         client.close()
@@ -323,7 +386,7 @@ def cmd_act(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Acquire → act(goal) → release. Exit 0 only if act reports ok."""
+    """Acquire -> act(goal) -> release. Exit 0 only if act reports ok."""
     if not args.goal:
         print("error: --goal required", file=sys.stderr)
         return 2
@@ -333,8 +396,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     acquired = False
     try:
         if not session_id:
-            acq = unwrap_tool_result(client.call_tool("acquire_desktop", {}))
-            emit({"phase": "acquire", "result": acq})
+            acq_params: dict[str, Any] = {}
+            if getattr(args, "owner_id", None):
+                acq_params["owner_id"] = args.owner_id
+            if getattr(args, "geometry", None):
+                acq_params["geometry"] = args.geometry
+            acq = unwrap_tool_result(client.call_tool("ensure_desktop", acq_params))
+            emit({"phase": "ensure", "result": acq})
             if isinstance(acq, dict):
                 session_id = acq.get("session_id") or acq.get("id") or ""
             acquired = bool(session_id)
@@ -412,6 +480,7 @@ def cmd_which(args: argparse.Namespace) -> int:
 
 # ─── argparse ────────────────────────────────────────────────────────────────
 
+
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--display",
@@ -428,6 +497,19 @@ def _add_common(p: argparse.ArgumentParser) -> None:
 
 def _add_session(p: argparse.ArgumentParser, required: bool = False) -> None:
     p.add_argument("--session-id", default="", required=required, help="Pool session id")
+
+
+def _add_owner(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--owner-id",
+        default=os.environ.get("DESKTOP_ACT_OWNER") or "",
+        help="Exclusive lease owner (default: $DESKTOP_ACT_OWNER or process id)",
+    )
+    p.add_argument(
+        "--geometry",
+        default=os.environ.get("DESKTOP_ACT_GEOMETRY") or "",
+        help="Desktop geometry e.g. 2560x1440 (default server/env)",
+    )
 
 
 def _add_act_opts(p: argparse.ArgumentParser) -> None:
@@ -470,11 +552,39 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p)
     p.set_defaults(func=cmd_list)
 
-    p = sub.add_parser("acquire", help="Acquire a desktop session")
+    p = sub.add_parser(
+        "ensure",
+        help="Multi-agent: reuse own lease or auto-spawn if another agent holds a desktop",
+    )
     _add_common(p)
+    _add_owner(p)
+    p.set_defaults(func=cmd_ensure)
+
+    p = sub.add_parser(
+        "acquire", help="Acquire a desktop (ensure by default; --force-new always spawns)"
+    )
+    _add_common(p)
+    _add_owner(p)
+    p.add_argument(
+        "--force-new",
+        action="store_true",
+        help="Always spawn a fresh exclusive desktop",
+    )
     p.set_defaults(func=cmd_acquire)
 
-    p = sub.add_parser("release", help="Release a session")
+    p = sub.add_parser(
+        "heartbeat", help="Refresh lease TTL so idle reaper will not free the session"
+    )
+    _add_common(p)
+    _add_session(p, required=True)
+    _add_owner(p)
+    p.set_defaults(func=cmd_heartbeat)
+
+    p = sub.add_parser("reap", help="Free locks + stop VNC for idle/dead pool sessions")
+    _add_common(p)
+    p.set_defaults(func=cmd_reap)
+
+    p = sub.add_parser("release", help="Release a session (free lock + stop pool VNC)")
     _add_common(p)
     _add_session(p, required=True)
     p.set_defaults(func=cmd_release)
@@ -498,10 +608,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "run",
-        help="Acquire → screenshot → act(goal) → release (one-shot goal loop)",
+        help="Ensure desktop -> screenshot -> act(goal) -> release (one-shot goal loop)",
     )
     _add_common(p)
     _add_session(p)
+    _add_owner(p)
     _add_act_opts(p)
     p.set_defaults(func=cmd_run)
 

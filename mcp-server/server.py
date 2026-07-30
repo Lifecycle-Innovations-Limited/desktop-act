@@ -15,7 +15,7 @@ Auth path: claude-agent-sdk only (bundled CLI OAuth, Claude Max subscription).
 from __future__ import annotations
 
 import asyncio
-import fcntl
+import atexit
 import hashlib
 import json
 import logging
@@ -27,6 +27,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -41,9 +42,21 @@ PLUGIN_ROOT = Path(
     or os.environ.get("DESKTOP_ACT_ROOT")
     or Path(__file__).resolve().parent.parent
 )
+_SYS = platform.system().lower()
+IS_MAC: bool = _SYS == "darwin"
+IS_WIN: bool = _SYS.startswith("win")
+
 LOG_DIR = Path(os.environ.get("DESKTOP_ACT_LOG_DIR", PLUGIN_ROOT / "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-TMP_ROOT = Path(os.environ.get("DESKTOP_ACT_TMP", "/tmp"))
+# Prefer OS temp on Windows; Linux/mac keep /tmp for shared multi-agent pool paths.
+if os.environ.get("DESKTOP_ACT_TMP"):
+    TMP_ROOT = Path(os.environ["DESKTOP_ACT_TMP"])
+elif IS_WIN:
+    import tempfile as _tempfile
+
+    TMP_ROOT = Path(_tempfile.gettempdir())
+else:
+    TMP_ROOT = Path("/tmp")
 SHOT_DIR = TMP_ROOT / "desktop-act-shots"
 SHOT_DIR.mkdir(parents=True, exist_ok=True)
 POOL_PATH = TMP_ROOT / "desktop-act-pool.json"
@@ -51,16 +64,42 @@ POOL_LOCK = TMP_ROOT / "desktop-act-pool.lock"
 SESSIONS_DIR = TMP_ROOT / "desktop-act-sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-IS_MAC: bool = platform.system().lower() == "darwin"
-
-DEFAULT_DISPLAY: str = os.environ.get(
-    "DESKTOP_ACT_DISPLAY", "mac:main" if IS_MAC else ":1"
-)
+DEFAULT_DISPLAY: str = os.environ.get("DESKTOP_ACT_DISPLAY", "mac:main" if IS_MAC else ":1")
 DISPLAY_NUM_MIN: int = int(os.environ.get("DESKTOP_ACT_DISPLAY_MIN", "50"))
 DISPLAY_NUM_MAX: int = int(os.environ.get("DESKTOP_ACT_DISPLAY_MAX", "99"))
 VNC_PORT_BASE: int = int(os.environ.get("DESKTOP_ACT_VNC_PORT_BASE", "5900"))
 NOVNC_PORT_BASE: int = int(os.environ.get("DESKTOP_ACT_NOVNC_PORT_BASE", "6082"))
-DEFAULT_GEOMETRY: str = os.environ.get("DESKTOP_ACT_GEOMETRY", "1280x800")
+# Wide default so multiple agents can place windows side-by-side on one seat;
+# concurrent agents should still each hold an exclusive leased session.
+DEFAULT_GEOMETRY: str = os.environ.get("DESKTOP_ACT_GEOMETRY", "2560x1440")
+# Exclusive lease TTL (seconds). Heartbeat / ensure refresh the lease.
+# Idle past this → reaper frees the lock and tears down Xvnc/websockify.
+LEASE_TTL_SEC: int = int(os.environ.get("DESKTOP_ACT_LEASE_TTL", "600"))
+# Background reaper interval (seconds). 0 disables the background loop.
+REAP_INTERVAL_SEC: int = int(os.environ.get("DESKTOP_ACT_REAP_INTERVAL", "30"))
+# When an owner is set and session_id is empty/busy, auto-spawn a free desktop.
+AUTO_SPAWN: bool = os.environ.get("DESKTOP_ACT_AUTO_SPAWN", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+# Tear down pool VNC when lease expires (idle) or owner process ends.
+REAP_ON_IDLE: bool = os.environ.get("DESKTOP_ACT_REAP_ON_IDLE", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+# On process exit, release sessions owned by this process.
+# Default on for long-lived MCP hosts. Stdio CLI sets DESKTOP_ACT_RELEASE_ON_EXIT=0
+# so one-shot ensure/list does not immediately kill the desktop it just created.
+RELEASE_ON_EXIT: bool = os.environ.get("DESKTOP_ACT_RELEASE_ON_EXIT", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 # macOS single-session id (stable across the process lifetime).
 MAC_SESSION_ID: str = "mac-main"
 MAC_DISPLAY: str = "mac:main"
@@ -117,9 +156,7 @@ BIN: dict[str, Optional[str]] = {
     "xterm": _which("xterm"),
     "xdotool": _which("xdotool"),
     # macOS system binaries (no-op on Linux).
-    "cliclick": _which(
-        "cliclick", "/opt/homebrew/bin/cliclick", "/usr/local/bin/cliclick"
-    ),
+    "cliclick": _which("cliclick", "/opt/homebrew/bin/cliclick", "/usr/local/bin/cliclick"),
     "screencapture": _which("screencapture", "/usr/sbin/screencapture"),
     "osascript": _which("osascript", "/usr/bin/osascript"),
     "open": _which("open", "/usr/bin/open"),
@@ -129,16 +166,13 @@ if IS_MAC:
     _missing_critical = [k for k in ("cliclick", "screencapture") if BIN[k] is None]
     if _missing_critical:
         log.warning(
-            "missing critical macOS binaries: %s — primitives will fail "
-            "(brew install cliclick)",
+            "missing critical macOS binaries: %s — primitives will fail (brew install cliclick)",
             _missing_critical,
         )
-else:
+elif not IS_WIN:
     _missing_critical = [k for k in ("Xvnc", "websockify") if BIN[k] is None]
     if _missing_critical:
-        log.warning(
-            "missing critical binaries: %s — pool spawn will fail", _missing_critical
-        )
+        log.warning("missing critical binaries: %s — pool spawn will fail", _missing_critical)
 
 
 # ─── Pool persistence (file-locked) ──────────────────────────────────────────
@@ -156,18 +190,141 @@ def _write_pool(pool: dict[str, dict]) -> None:
 
 
 class _PoolLock:
-    """Cross-process flock guard for pool mutations."""
+    """Cross-process exclusive lock for pool mutations.
+
+    Unix: fcntl.flock. Windows: msvcrt.locking on a 1-byte region (fcntl is
+    unavailable). Pool multi-desktop is Linux-primary; Windows only guards the
+    lease JSON for the limited hybrid backend.
+    """
 
     def __enter__(self):
-        self.fd = POOL_LOCK.open("w")
-        fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX)
+        # "a+" so the file exists and is readable for msvcrt byte locks.
+        self.fd = POOL_LOCK.open("a+")
+        if IS_WIN:
+            import msvcrt
+
+            self.fd.seek(0, os.SEEK_END)
+            if self.fd.tell() == 0:
+                self.fd.write("0")
+                self.fd.flush()
+            self.fd.seek(0)
+            # LK_LOCK blocks until the region is free.
+            msvcrt.locking(self.fd.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX)
         return self
 
     def __exit__(self, *exc):
         try:
-            fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+            if IS_WIN:
+                import msvcrt
+
+                self.fd.seek(0)
+                try:
+                    msvcrt.locking(self.fd.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                import fcntl
+
+                fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
         finally:
             self.fd.close()
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+def _default_owner_id() -> str:
+    """Stable-enough owner id for this process when caller omits owner_id."""
+    env = (os.environ.get("DESKTOP_ACT_OWNER") or "").strip()
+    if env:
+        return env
+    # Prefer explicit agent/session ids if present (Claude/Grok/etc.).
+    for key in (
+        "CLAUDE_SESSION_ID",
+        "CLAUDE_AGENT_ID",
+        "GROK_SESSION_ID",
+        "AGENT_ID",
+        "SESSION_ID",
+    ):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            return f"{key.lower()}:{v[:48]}"
+    return f"pid-{os.getpid()}"
+
+
+def _lease_expired(sess: dict, now: Optional[int] = None) -> bool:
+    now = _now() if now is None else now
+    until = int(sess.get("lease_until") or 0)
+    if until <= 0:
+        # No lease recorded → treat as free for claim.
+        return True
+    return until < now
+
+
+def _lease_held_by_other(sess: dict, owner_id: str, now: Optional[int] = None) -> bool:
+    """True if sess has a live exclusive lease for a different owner."""
+    now = _now() if now is None else now
+    held = (sess.get("owner_id") or "").strip()
+    if not held:
+        return False
+    if held == owner_id:
+        return False
+    return not _lease_expired(sess, now)
+
+
+def _apply_lease(sess: dict, owner_id: str, ttl: Optional[int] = None) -> dict:
+    ttl = LEASE_TTL_SEC if ttl is None else int(ttl)
+    owner = (owner_id or "").strip() or _default_owner_id()
+    sess["owner_id"] = owner
+    sess["lease_until"] = _now() + max(30, ttl)
+    sess["lease_ttl_sec"] = max(30, ttl)
+    sess["leased_at"] = _now()
+    return sess
+
+
+def _clear_lease(sess: dict) -> dict:
+    sess["owner_id"] = ""
+    sess["lease_until"] = 0
+    return sess
+
+
+def _kill_session_procs(sess: dict, grace: float = 0.3) -> list[dict]:
+    """SIGTERM then SIGKILL Xvnc/WM/websockify for a pool session. Returns killed list."""
+    killed: list[dict] = []
+    for key in ("websockify_pid", "wm_pid", "xvnc_pid"):
+        pid = int(sess.get(key) or 0)
+        if pid and _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed.append({key: pid})
+            except OSError:
+                pass
+    if grace > 0:
+        time.sleep(grace)
+    for key in ("websockify_pid", "wm_pid", "xvnc_pid"):
+        pid = int(sess.get(key) or 0)
+        if pid and _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    # Cleanup X lock sockets (Linux pool only).
+    dnum = sess.get("display_num")
+    if dnum is not None:
+        for lock in (
+            Path(f"/tmp/.X{dnum}-lock"),
+            Path(f"/tmp/.X11-unix/X{dnum}"),
+        ):
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return killed
 
 
 def _port_free(port: int) -> bool:
@@ -279,15 +436,11 @@ class Backend(Protocol):
         use_cache: bool,
     ) -> dict: ...
 
-    async def click(
-        self, x: int, y: int, button: int, double: bool, session_id: str
-    ) -> dict: ...
+    async def click(self, x: int, y: int, button: int, double: bool, session_id: str) -> dict: ...
 
     async def type_text(self, text: str, session_id: str, delay_ms: int) -> dict: ...
 
-    async def keypress(
-        self, key: str, modifiers: Optional[list[str]], session_id: str
-    ) -> dict: ...
+    async def keypress(self, key: str, modifiers: Optional[list[str]], session_id: str) -> dict: ...
 
     async def scroll(
         self, direction: str, amount: int, x: int, y: int, session_id: str
@@ -297,11 +450,19 @@ class Backend(Protocol):
 
     async def launch_app(self, command: str, session_id: str) -> dict: ...
 
-    async def acquire_desktop(self, geometry: str) -> dict: ...
+    async def acquire_desktop(
+        self, geometry: str, owner_id: str = "", force_new: bool = False
+    ) -> dict: ...
+
+    async def ensure_desktop(self, geometry: str, owner_id: str = "") -> dict: ...
+
+    async def heartbeat_desktop(self, session_id: str, owner_id: str = "") -> dict: ...
 
     async def release_desktop(self, session_id: str) -> dict: ...
 
     async def list_desktops(self) -> dict: ...
+
+    async def reap_idle_desktops(self) -> dict: ...
 
 
 # ─── X11 backend (Linux) ─────────────────────────────────────────────────────
@@ -310,26 +471,71 @@ class Backend(Protocol):
 # but string_to_keysym("at") returns the right keysym. Without this map, typing
 # strings containing punctuation silently drops the offending characters.
 _CHAR_TO_KEYSYM_NAME: dict[str, str] = {
-    " ": "space", "\n": "Return", "\t": "Tab",
-    "!": "exclam", "\"": "quotedbl", "#": "numbersign", "$": "dollar",
-    "%": "percent", "&": "ampersand", "'": "apostrophe", "(": "parenleft",
-    ")": "parenright", "*": "asterisk", "+": "plus", ",": "comma",
-    "-": "minus", ".": "period", "/": "slash", ":": "colon", ";": "semicolon",
-    "<": "less", "=": "equal", ">": "greater", "?": "question", "@": "at",
-    "[": "bracketleft", "\\": "backslash", "]": "bracketright",
-    "^": "asciicircum", "_": "underscore", "`": "grave",
-    "{": "braceleft", "|": "bar", "}": "braceright", "~": "asciitilde",
+    " ": "space",
+    "\n": "Return",
+    "\t": "Tab",
+    "!": "exclam",
+    '"': "quotedbl",
+    "#": "numbersign",
+    "$": "dollar",
+    "%": "percent",
+    "&": "ampersand",
+    "'": "apostrophe",
+    "(": "parenleft",
+    ")": "parenright",
+    "*": "asterisk",
+    "+": "plus",
+    ",": "comma",
+    "-": "minus",
+    ".": "period",
+    "/": "slash",
+    ":": "colon",
+    ";": "semicolon",
+    "<": "less",
+    "=": "equal",
+    ">": "greater",
+    "?": "question",
+    "@": "at",
+    "[": "bracketleft",
+    "\\": "backslash",
+    "]": "bracketright",
+    "^": "asciicircum",
+    "_": "underscore",
+    "`": "grave",
+    "{": "braceleft",
+    "|": "bar",
+    "}": "braceright",
+    "~": "asciitilde",
 }
 
 # Keysym NAMES that live at the shifted level on a US PC layout — when the caller
 # does `keypress("at")` we must hold Shift, otherwise fake_input sends the base
 # keycode for "2" and the wrong character lands in the focused widget.
-_SHIFT_REQUIRED_KEYSYMS: frozenset[str] = frozenset({
-    "exclam", "at", "numbersign", "dollar", "percent", "asciicircum",
-    "ampersand", "asterisk", "parenleft", "parenright", "underscore",
-    "plus", "braceleft", "braceright", "bar", "colon", "quotedbl",
-    "less", "greater", "question", "asciitilde",
-})
+_SHIFT_REQUIRED_KEYSYMS: frozenset[str] = frozenset(
+    {
+        "exclam",
+        "at",
+        "numbersign",
+        "dollar",
+        "percent",
+        "asciicircum",
+        "ampersand",
+        "asterisk",
+        "parenleft",
+        "parenright",
+        "underscore",
+        "plus",
+        "braceleft",
+        "braceright",
+        "bar",
+        "colon",
+        "quotedbl",
+        "less",
+        "greater",
+        "question",
+        "asciitilde",
+    }
+)
 
 
 class X11Backend:
@@ -418,7 +624,7 @@ class X11Backend:
         }
 
     async def type_text(self, text, session_id, delay_ms) -> dict:
-        from Xlib import X, XK
+        from Xlib import XK, X
         from Xlib.ext.xtest import fake_input
 
         display = self._resolve_display(session_id)
@@ -443,7 +649,7 @@ class X11Backend:
         return {"ok": True, "chars": len(text), "display": display}
 
     async def keypress(self, key, modifiers, session_id) -> dict:
-        from Xlib import X, XK
+        from Xlib import XK, X
         from Xlib.ext.xtest import fake_input
 
         display = self._resolve_display(session_id)
@@ -452,9 +658,7 @@ class X11Backend:
         # Auto-add Shift when the requested keysym sits at the shifted level of
         # its keycode (e.g. "at", "exclam", "question"); without this, fake_input
         # sends the base keycode and types "2", "1", "/" instead.
-        if key in _SHIFT_REQUIRED_KEYSYMS and not any(
-            m.lower() == "shift" for m in mods
-        ):
+        if key in _SHIFT_REQUIRED_KEYSYMS and not any(m.lower() == "shift" for m in mods):
             mods.append("Shift")
         mcodes = [d.keysym_to_keycode(XK.string_to_keysym(m + "_L")) for m in mods]
         kc = d.keysym_to_keycode(XK.string_to_keysym(key))
@@ -499,9 +703,7 @@ class X11Backend:
                 name = w.get_wm_name()
                 g = w.get_geometry()
                 if name:
-                    wins.append(
-                        {"name": name, "x": g.x, "y": g.y, "w": g.width, "h": g.height}
-                    )
+                    wins.append({"name": name, "x": g.x, "y": g.y, "w": g.width, "h": g.height})
             except Exception:  # noqa: BLE001
                 pass
         return {"ok": True, "windows": wins, "display": display}
@@ -563,9 +765,7 @@ class X11Backend:
                 ready = True
                 break
             if xvnc.poll() is not None:
-                raise RuntimeError(
-                    f"Xvnc exited early (code={xvnc.returncode}) — see {log_path}"
-                )
+                raise RuntimeError(f"Xvnc exited early (code={xvnc.returncode}) — see {log_path}")
             time.sleep(0.1)
         if not ready:
             xvnc.terminate()
@@ -625,88 +825,255 @@ class X11Backend:
             "created_at": int(time.time()),
         }
 
-    async def acquire_desktop(self, geometry) -> dict:
-        with _PoolLock():
-            pool = _read_pool()
-            used_nums = {s["display_num"] for s in pool.values()}
-            chosen: Optional[int] = None
-            for n in range(DISPLAY_NUM_MIN, DISPLAY_NUM_MAX + 1):
-                if n in used_nums:
-                    continue
-                if _display_in_use(n):
-                    continue
-                chosen = n
-                break
-            if chosen is None:
+    def _close_display_cache(self, display: str) -> None:
+        d = self._displays.pop(display, None)
+        if d is not None:
+            try:
+                d.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _LAST_SHOT.pop(display, None)
+
+    def _pick_free_display_num(self, pool: dict) -> Optional[int]:
+        used_nums = {s.get("display_num") for s in pool.values() if "display_num" in s}
+        for n in range(DISPLAY_NUM_MIN, DISPLAY_NUM_MAX + 1):
+            if n in used_nums:
+                continue
+            if _display_in_use(n):
+                continue
+            return n
+        return None
+
+    def _spawn_and_lease(self, geometry: str, owner_id: str, pool: dict) -> dict:
+        """Spawn under pool lock (caller holds lock). Returns result dict."""
+        chosen = self._pick_free_display_num(pool)
+        if chosen is None:
+            return {
+                "ok": False,
+                "error": f"no free display in :{DISPLAY_NUM_MIN}-:{DISPLAY_NUM_MAX}",
+            }
+        # Spawn outside? Xvnc can take seconds — still under lock to avoid races.
+        session = self._spawn_desktop(chosen, geometry)
+        _apply_lease(session, owner_id)
+        session["owner_pid"] = os.getpid()
+        pool[session["session_id"]] = session
+        _write_pool(pool)
+        return {"ok": True, "reused": False, "spawned": True, **session}
+
+    async def ensure_desktop(self, geometry: str = DEFAULT_GEOMETRY, owner_id: str = "") -> dict:
+        """Return an exclusive desktop for owner_id.
+
+        - Reuse owner's live leased session (refresh TTL).
+        - Else claim an idle/expired pool session (refresh + re-lease).
+        - Else spawn a new Xvnc on the next free display/port.
+        Never steals a non-expired lease from another owner.
+        """
+        owner = (owner_id or "").strip() or _default_owner_id()
+        geo = geometry or DEFAULT_GEOMETRY
+
+        def _sync() -> dict:
+            with _PoolLock():
+                pool = _read_pool()
+                # Drop dead processes first (free slots without waiting for reaper).
+                self._reap_pool_locked(pool, reason="ensure-precheck")
+                # 1) Owner already holds a live session.
+                for sid, s in list(pool.items()):
+                    if (s.get("owner_id") or "") == owner and self._session_alive(s):
+                        _apply_lease(s, owner)
+                        pool[sid] = s
+                        _write_pool(pool)
+                        return {"ok": True, "reused": True, "spawned": False, **s}
+                # 2) Claim free / lease-expired but still-alive desktop.
+                for sid, s in list(pool.items()):
+                    if not self._session_alive(s):
+                        continue
+                    if _lease_held_by_other(s, owner):
+                        continue
+                    _apply_lease(s, owner)
+                    s["owner_pid"] = os.getpid()
+                    pool[sid] = s
+                    _write_pool(pool)
+                    return {
+                        "ok": True,
+                        "reused": True,
+                        "claimed": True,
+                        "spawned": False,
+                        **s,
+                    }
+                # 3) Auto-spawn new exclusive desktop.
+                if not AUTO_SPAWN:
+                    return {
+                        "ok": False,
+                        "error": "no free desktop and DESKTOP_ACT_AUTO_SPAWN=0",
+                        "owner_id": owner,
+                    }
+                return self._spawn_and_lease(geo, owner, pool)
+
+        return await asyncio.get_event_loop().run_in_executor(None, _sync)
+
+    async def acquire_desktop(
+        self, geometry: str = DEFAULT_GEOMETRY, owner_id: str = "", force_new: bool = False
+    ) -> dict:
+        """Acquire a desktop for this agent.
+
+        Default (force_new=False): ensure_desktop — reuse own lease or spawn if busy.
+        force_new=True: always spawn a fresh exclusive session (old always-new behavior).
+        """
+        owner = (owner_id or "").strip() or _default_owner_id()
+        geo = geometry or DEFAULT_GEOMETRY
+        if not force_new:
+            return await self.ensure_desktop(geo, owner)
+
+        def _sync() -> dict:
+            with _PoolLock():
+                pool = _read_pool()
+                self._reap_pool_locked(pool, reason="acquire-force-new")
+                return self._spawn_and_lease(geo, owner, pool)
+
+        return await asyncio.get_event_loop().run_in_executor(None, _sync)
+
+    async def heartbeat_desktop(self, session_id: str, owner_id: str = "") -> dict:
+        """Refresh lease TTL so the idle reaper does not tear the session down."""
+        owner = (owner_id or "").strip() or _default_owner_id()
+
+        def _sync() -> dict:
+            with _PoolLock():
+                pool = _read_pool()
+                sess = pool.get(session_id)
+                if not sess:
+                    return {"ok": False, "error": f"unknown session_id: {session_id}"}
+                if _lease_held_by_other(sess, owner):
+                    return {
+                        "ok": False,
+                        "error": "lease held by another owner",
+                        "owner_id": sess.get("owner_id"),
+                        "lease_until": sess.get("lease_until"),
+                    }
+                _apply_lease(sess, owner)
+                pool[session_id] = sess
+                _write_pool(pool)
                 return {
-                    "ok": False,
-                    "error": f"no free display in :{DISPLAY_NUM_MIN}-:{DISPLAY_NUM_MAX}",
+                    "ok": True,
+                    "session_id": session_id,
+                    "owner_id": sess.get("owner_id"),
+                    "lease_until": sess.get("lease_until"),
                 }
 
-            session = await asyncio.get_event_loop().run_in_executor(
-                None, self._spawn_desktop, chosen, geometry
-            )
-            pool[session["session_id"]] = session
-            _write_pool(pool)
-            return {"ok": True, **session}
+        return await asyncio.get_event_loop().run_in_executor(None, _sync)
 
-    async def release_desktop(self, session_id) -> dict:
-        with _PoolLock():
-            pool = _read_pool()
-            sess = pool.get(session_id)
-            if not sess:
-                return {"ok": False, "error": f"unknown session_id: {session_id}"}
+    def _release_locked(self, pool: dict, session_id: str) -> dict:
+        """Release under held pool lock. Kills VNC stack and drops lease."""
+        sess = pool.get(session_id)
+        if not sess:
+            return {"ok": False, "error": f"unknown session_id: {session_id}"}
+        display = sess.get("display") or ""
+        if display:
+            self._close_display_cache(display)
+        killed = _kill_session_procs(sess)
+        del pool[session_id]
+        _write_pool(pool)
+        return {
+            "ok": True,
+            "released": session_id,
+            "killed": killed,
+            "owner_id": sess.get("owner_id") or "",
+        }
 
-            # Close cached X11 connection
-            d = self._displays.pop(sess["display"], None)
-            if d is not None:
-                try:
-                    d.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            _LAST_SHOT.pop(sess["display"], None)
+    async def release_desktop(self, session_id: str) -> dict:
+        def _sync() -> dict:
+            with _PoolLock():
+                pool = _read_pool()
+                return self._release_locked(pool, session_id)
 
-            killed: list[dict] = []
-            for key in ("websockify_pid", "wm_pid", "xvnc_pid"):
-                pid = sess.get(key)
-                if pid and _pid_alive(pid):
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                        killed.append({key: pid})
-                    except OSError:
-                        pass
-            await asyncio.sleep(0.3)
-            for key in ("websockify_pid", "wm_pid", "xvnc_pid"):
-                pid = sess.get(key)
-                if pid and _pid_alive(pid):
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except OSError:
-                        pass
-
-            # Cleanup X lock files
-            for lock in (
-                Path(f"/tmp/.X{sess['display_num']}-lock"),
-                Path(f"/tmp/.X11-unix/X{sess['display_num']}"),
-            ):
-                try:
-                    lock.unlink(missing_ok=True)
-                except OSError:
-                    pass
-
-            del pool[session_id]
-            _write_pool(pool)
-            return {"ok": True, "released": session_id, "killed": killed}
+        return await asyncio.get_event_loop().run_in_executor(None, _sync)
 
     @staticmethod
     def _session_alive(sess: dict) -> bool:
-        return _pid_alive(sess.get("xvnc_pid", 0))
+        return _pid_alive(int(sess.get("xvnc_pid") or 0))
+
+    def _reap_pool_locked(self, pool: dict, reason: str = "reap") -> list[dict]:
+        """Free locks + kill VNC for dead or idle-expired pool sessions. Mutates pool."""
+        if not REAP_ON_IDLE and reason.startswith("idle"):
+            return []
+        now = _now()
+        reaped: list[dict] = []
+        for sid in list(pool.keys()):
+            s = pool[sid]
+            # Never reap non-pool / mac-main style records without xvnc.
+            if "xvnc_pid" not in s and "display_num" not in s:
+                continue
+            dead = not self._session_alive(s)
+            # Only idle-reap sessions that actually held a timed lease.
+            had_lease = int(s.get("lease_until") or 0) > 0 or bool(s.get("owner_id"))
+            idle = (
+                REAP_ON_IDLE
+                and had_lease
+                and _lease_expired(s, now)
+                and int(s.get("lease_until") or 0) > 0
+            )
+            # Dead Xvnc always reaped; idle lease-expired also reaped (stop VNC load).
+            if not (dead or idle):
+                continue
+            display = s.get("display") or ""
+            if display:
+                self._close_display_cache(display)
+            killed = _kill_session_procs(s)
+            del pool[sid]
+            reaped.append(
+                {
+                    "session_id": sid,
+                    "reason": "dead" if dead else "lease_expired",
+                    "via": reason,
+                    "owner_id": s.get("owner_id") or "",
+                    "killed": killed,
+                }
+            )
+            log.info(
+                "reaped session %s reason=%s owner=%s",
+                sid,
+                "dead" if dead else "lease_expired",
+                s.get("owner_id"),
+            )
+        if reaped:
+            _write_pool(pool)
+        return reaped
+
+    async def reap_idle_desktops(self) -> dict:
+        """Tear down pool sessions whose lease expired or whose Xvnc died.
+
+        Frees the exclusive lock and stops Xvnc + websockify to avoid load.
+        Does not touch the host default display (e.g. :1 reauth Chrome).
+        """
+
+        def _sync() -> dict:
+            with _PoolLock():
+                pool = _read_pool()
+                reaped = self._reap_pool_locked(pool, reason="idle-reap")
+                return {
+                    "ok": True,
+                    "reaped": reaped,
+                    "count": len(reaped),
+                    "remaining": len(pool),
+                }
+
+        return await asyncio.get_event_loop().run_in_executor(None, _sync)
 
     async def list_desktops(self) -> dict:
+        # Opportunistic reap so list stays honest under multi-agent load.
+        with _PoolLock():
+            pool = _read_pool()
+            self._reap_pool_locked(pool, reason="list-precheck")
         pool = _read_pool()
         sessions = []
+        now = _now()
         for _sid, s in pool.items():
-            sessions.append({**s, "alive": self._session_alive(s)})
+            sessions.append(
+                {
+                    **s,
+                    "alive": self._session_alive(s),
+                    "lease_expired": _lease_expired(s, now),
+                }
+            )
         return {"ok": True, "count": len(sessions), "sessions": sessions}
 
 
@@ -738,8 +1105,7 @@ class MacBackend:
         if not session_id or session_id == MAC_SESSION_ID:
             return MAC_DISPLAY
         raise ValueError(
-            f"unknown session_id: {session_id} "
-            f"(macOS has a single session: {MAC_SESSION_ID!r})"
+            f"unknown session_id: {session_id} (macOS has a single session: {MAC_SESSION_ID!r})"
         )
 
     async def _run(self, *argv: str) -> tuple[int, str, str]:
@@ -798,9 +1164,7 @@ class MacBackend:
         cc = self._cliclick()
         # 4/5 scroll buttons → delegate to scroll for X11 parity.
         if button in (4, 5):
-            return await self.scroll(
-                "up" if button == 4 else "down", 1, x, y, session_id
-            )
+            return await self.scroll("up" if button == 4 else "down", 1, x, y, session_id)
         verbs = self._BTN.get(button)
         if verbs is None:
             return {
@@ -917,9 +1281,7 @@ class MacBackend:
             dx = -amount
         else:
             dy = -amount
-        rc, _out, err = await self._run(
-            MAC_SYSTEM_PYTHON, "-c", _MAC_SCROLL_PY, str(dy), str(dx)
-        )
+        rc, _out, err = await self._run(MAC_SYSTEM_PYTHON, "-c", _MAC_SCROLL_PY, str(dy), str(dx))
         if rc != 0:
             raise RuntimeError(f"scroll failed (rc={rc}): {err.strip()}")
         return {
@@ -1071,17 +1433,96 @@ class MacBackend:
             return _pid_alive(ws)
         return False
 
-    async def acquire_desktop(self, geometry) -> dict:
+    async def ensure_desktop(self, geometry: str = DEFAULT_GEOMETRY, owner_id: str = "") -> dict:
+        # Single real desktop — lease is advisory; second agent is warned but can share.
+        return await self.acquire_desktop(geometry, owner_id=owner_id, force_new=False)
+
+    async def acquire_desktop(
+        self, geometry: str = DEFAULT_GEOMETRY, owner_id: str = "", force_new: bool = False
+    ) -> dict:
         # macOS: one real session. Persist a stable record; bridge VNC best-effort.
+        owner = (owner_id or "").strip() or _default_owner_id()
         bridge = await self._start_bridge()
         session = self._session_record(geometry, bridge)
+        _apply_lease(session, owner)
+        session["owner_pid"] = os.getpid()
         with _PoolLock():
             pool = _read_pool()
-            # Pool hygiene: the shared /tmp pool may carry stale X11 (desk-*) entries
-            # from a prior boot/OS. On mac, the pool must contain only mac-main.
+            prev = pool.get(MAC_SESSION_ID) or {}
+            if not force_new and prev.get("owner_id") and _lease_held_by_other(prev, owner):
+                # Cannot spawn a second real desktop on macOS.
+                return {
+                    "ok": True,
+                    "reused": True,
+                    "spawned": False,
+                    "shared": True,
+                    "warning": (
+                        "macOS has one desktop; another owner holds the lease. "
+                        "Primitives still target the real session (limited isolation)."
+                    ),
+                    "other_owner": prev.get("owner_id"),
+                    **{
+                        **session,
+                        **{k: prev.get(k, session.get(k)) for k in ("owner_id", "lease_until")},
+                    },
+                    "session_id": MAC_SESSION_ID,
+                }
+            # Pool hygiene: drop stale Linux desk-* entries if any.
             pool = {MAC_SESSION_ID: session}
             _write_pool(pool)
-        return {"ok": True, **session}
+        return {"ok": True, "reused": False, "spawned": False, **session}
+
+    async def heartbeat_desktop(self, session_id: str, owner_id: str = "") -> dict:
+        owner = (owner_id or "").strip() or _default_owner_id()
+        with _PoolLock():
+            pool = _read_pool()
+            sess = pool.get(session_id) or pool.get(MAC_SESSION_ID)
+            if not sess:
+                return {"ok": False, "error": f"unknown session_id: {session_id}"}
+            _apply_lease(sess, owner)
+            pool[sess["session_id"]] = sess
+            _write_pool(pool)
+            return {
+                "ok": True,
+                "session_id": sess["session_id"],
+                "owner_id": sess.get("owner_id"),
+                "lease_until": sess.get("lease_until"),
+            }
+
+    async def reap_idle_desktops(self) -> dict:
+        # macOS: only drop expired lease metadata + optional websockify bridge.
+        # Never terminate the user's login session / Screen Sharing.
+        reaped: list[dict] = []
+        with _PoolLock():
+            pool = _read_pool()
+            sess = pool.get(MAC_SESSION_ID)
+            if (
+                sess
+                and REAP_ON_IDLE
+                and int(sess.get("lease_until") or 0) > 0
+                and _lease_expired(sess)
+            ):
+                _clear_lease(sess)
+                pid = sess.get("websockify_pid") or self._bridge_pid
+                killed: list[dict] = []
+                if pid and _pid_alive(int(pid)):
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                        killed.append({"websockify_pid": int(pid)})
+                    except OSError:
+                        pass
+                    self._bridge_pid = None
+                pool[MAC_SESSION_ID] = sess
+                _write_pool(pool)
+                reaped.append(
+                    {
+                        "session_id": MAC_SESSION_ID,
+                        "reason": "lease_expired",
+                        "killed": killed,
+                        "note": "user desktop kept; bridge only",
+                    }
+                )
+        return {"ok": True, "reaped": reaped, "count": len(reaped), "remaining": 1}
 
     async def release_desktop(self, session_id) -> dict:
         # Only tear down the optional websockify bridge — never the user's session.
@@ -1107,6 +1548,9 @@ class MacBackend:
                         os.kill(pid, signal.SIGKILL)
                     except OSError:
                         pass
+            _clear_lease(sess)
+            pool[session_id] = sess
+            _write_pool(pool)
             self._bridge_pid = None
             _LAST_SHOT.pop(sess["display"], None)
             pool.pop(session_id, None)
@@ -1129,8 +1573,168 @@ class MacBackend:
         return {"ok": True, "count": len(sessions), "sessions": sessions}
 
 
+# ─── Windows backend (limited / hybrid) ──────────────────────────────────────
+class WinBackend:
+    """Windows backend stub — server starts; native automation is partial.
+
+    Pool multi-desktop (Xvnc) is Linux-only. On Windows, ensure/acquire return a
+    stable pseudo-session and clear guidance to use browser tools (Playwright /
+    CDP) for GUI work until a native backend ships. Lease/reap APIs still work
+    as no-ops so multi-agent callers stay portable.
+    """
+
+    name = "windows"
+
+    def __init__(self) -> None:
+        self._session: dict = {
+            "session_id": "win-main",
+            "display": "win:main",
+            "geometry": DEFAULT_GEOMETRY,
+            "novnc_url": None,
+            "created_at": _now(),
+            "limited": True,
+            "platform_note": (
+                "Windows: desktop-act pool VNC is Linux-only. "
+                "Use browser automation for GUI; ensure_desktop is lease-only here."
+            ),
+        }
+
+    def _resolve_display(self, session_id: str = "") -> str:
+        return "win:main"
+
+    @staticmethod
+    def _session_alive(sess: dict) -> bool:
+        return True
+
+    def _limited(self, op: str) -> dict:
+        return {
+            "ok": False,
+            "error": f"{op} not available on Windows native backend yet",
+            "hint": self._session["platform_note"],
+            "platform": "Windows",
+        }
+
+    async def screenshot(self, session_id, region, fmt, max_width, use_cache) -> dict:
+        return self._limited("screenshot")
+
+    async def click(self, x, y, button, double, session_id) -> dict:
+        return self._limited("click")
+
+    async def type_text(self, text, session_id, delay_ms) -> dict:
+        return self._limited("type_text")
+
+    async def keypress(self, key, modifiers, session_id) -> dict:
+        return self._limited("keypress")
+
+    async def scroll(self, direction, amount, x, y, session_id) -> dict:
+        return self._limited("scroll")
+
+    async def list_windows(self, session_id) -> dict:
+        return {"ok": True, "windows": [], "display": "win:main", "limited": True}
+
+    async def launch_app(self, command, session_id) -> dict:
+        return self._limited("launch_app")
+
+    async def ensure_desktop(self, geometry: str = DEFAULT_GEOMETRY, owner_id: str = "") -> dict:
+        owner = (owner_id or "").strip() or _default_owner_id()
+        geo = geometry or DEFAULT_GEOMETRY
+        with _PoolLock():
+            pool = _read_pool()
+            prev = pool.get("win-main") or {}
+            if prev and _lease_held_by_other(prev, owner):
+                # No second real desktop on Windows either — surface share warning.
+                out = {
+                    **dict(self._session),
+                    **prev,
+                    "geometry": prev.get("geometry") or geo,
+                    "ok": True,
+                    "reused": True,
+                    "spawned": False,
+                    "shared": True,
+                    "limited": True,
+                    "warning": (
+                        "Windows has no pool VNC; another owner holds the lease. "
+                        + (self._session.get("platform_note") or "")
+                    ),
+                    "other_owner": prev.get("owner_id"),
+                }
+                return out
+            s = dict(self._session)
+            _apply_lease(s, owner)
+            s["geometry"] = geo
+            s["owner_pid"] = os.getpid()
+            pool["win-main"] = s
+            _write_pool(pool)
+        return {
+            "ok": True,
+            "reused": True,
+            "spawned": False,
+            "limited": True,
+            **s,
+            "warning": s["platform_note"],
+        }
+
+    async def acquire_desktop(
+        self, geometry: str = DEFAULT_GEOMETRY, owner_id: str = "", force_new: bool = False
+    ) -> dict:
+        return await self.ensure_desktop(geometry, owner_id=owner_id)
+
+    async def heartbeat_desktop(self, session_id: str, owner_id: str = "") -> dict:
+        owner = (owner_id or "").strip() or _default_owner_id()
+        with _PoolLock():
+            pool = _read_pool()
+            s = pool.get(session_id) or dict(self._session)
+            _apply_lease(s, owner)
+            pool[s["session_id"]] = s
+            _write_pool(pool)
+            return {
+                "ok": True,
+                "session_id": s["session_id"],
+                "owner_id": s.get("owner_id"),
+                "lease_until": s.get("lease_until"),
+                "limited": True,
+            }
+
+    async def release_desktop(self, session_id: str) -> dict:
+        with _PoolLock():
+            pool = _read_pool()
+            if session_id in pool:
+                del pool[session_id]
+                _write_pool(pool)
+        return {
+            "ok": True,
+            "released": session_id,
+            "killed": [],
+            "note": "Windows: no VNC pool to tear down",
+            "limited": True,
+        }
+
+    async def list_desktops(self) -> dict:
+        pool = _read_pool()
+        sessions = [{**s, "alive": True, "limited": True} for s in pool.values()]
+        return {"ok": True, "count": len(sessions), "sessions": sessions, "limited": True}
+
+    async def reap_idle_desktops(self) -> dict:
+        reaped: list[dict] = []
+        with _PoolLock():
+            pool = _read_pool()
+            for sid in list(pool.keys()):
+                s = pool[sid]
+                if int(s.get("lease_until") or 0) > 0 and _lease_expired(s):
+                    del pool[sid]
+                    reaped.append({"session_id": sid, "reason": "lease_expired"})
+            if reaped:
+                _write_pool(pool)
+        return {"ok": True, "reaped": reaped, "count": len(reaped), "remaining": len(_read_pool())}
+
+
 # ─── Backend dispatch ─────────────────────────────────────────────────────────
-BACKEND: Backend = MacBackend() if IS_MAC else X11Backend()
+if IS_MAC:
+    BACKEND: Backend = MacBackend()
+elif IS_WIN:
+    BACKEND = WinBackend()
+else:
+    BACKEND = X11Backend()
 log.info("active backend: %s (platform=%s)", BACKEND.name, platform.system())
 
 
@@ -1145,8 +1749,10 @@ mcp = FastMCP(
     instructions=(
         "Computer-use primitives + multi-desktop pool + autonomous act() loop. "
         "OS-agnostic: X11/Xvnc pool on Linux, screencapture + cliclick on macOS. "
-        "Call acquire_desktop() for a session; pass session_id to primitives. "
-        "Optimized: SHA-dedupe screenshot cache, JPEG default."
+        "Multi-agent: call ensure_desktop(owner_id=…) — exclusive lease per agent; "
+        "if another agent holds a desktop, a new Xvnc auto-spawns on a free port. "
+        "Idle/lease-expired sessions are reaped (lock freed + VNC stopped). "
+        "Pass session_id to primitives. Optimized: SHA-dedupe screenshot cache, JPEG default."
     ),
 )
 
@@ -1196,9 +1802,7 @@ async def type_text(text: str, session_id: str = "", delay_ms: int = 5) -> dict:
 
 
 @mcp.tool
-async def keypress(
-    key: str, modifiers: Optional[list[str]] = None, session_id: str = ""
-) -> dict:
+async def keypress(key: str, modifiers: Optional[list[str]] = None, session_id: str = "") -> dict:
     """Press a key chord. e.g. key='Return', modifiers=['Control']."""
     try:
         return await BACKEND.keypress(key, modifiers, session_id)
@@ -1341,13 +1945,9 @@ async def act_step(
                 session_id,
             )
         elif op == "type_text":
-            action_result = await type_text(
-                action["text"], session_id, action.get("delay_ms", 5)
-            )
+            action_result = await type_text(action["text"], session_id, action.get("delay_ms", 5))
         elif op == "keypress":
-            action_result = await keypress(
-                action["key"], action.get("modifiers"), session_id
-            )
+            action_result = await keypress(action["key"], action.get("modifiers"), session_id)
         elif op == "scroll":
             action_result = await scroll(
                 action["direction"],
@@ -1399,28 +1999,66 @@ async def act_step(
 
 # ─── Multi-desktop pool tools (delegate to BACKEND) ──────────────────────────
 @mcp.tool
-async def acquire_desktop(geometry: str = DEFAULT_GEOMETRY) -> dict:
-    """Acquire a desktop session.
+async def ensure_desktop(
+    geometry: str = DEFAULT_GEOMETRY,
+    owner_id: str = "",
+) -> dict:
+    """Get an exclusive desktop for this agent (multi-agent safe).
 
-    Linux: spawns a fresh Xvnc + websockify on the next free display.
-    macOS: returns the single real logged-in session (no Xvnc) bound to mac:main,
-    bridging built-in Screen Sharing → noVNC when available.
+    - Reuses this owner_id's live leased session (refreshes TTL).
+    - Else claims an idle/expired pool seat.
+    - Else auto-spawns a new Xvnc + noVNC on the next free display/port.
+    Never steals a non-expired lease from another owner.
 
-    Returns {session_id, display, novnc_url, geometry, ...}. Pass session_id to primitives.
+    Pass owner_id (or set DESKTOP_ACT_OWNER). Returns session_id + novnc_url.
     """
     try:
-        return await BACKEND.acquire_desktop(geometry)
+        return await BACKEND.ensure_desktop(geometry, owner_id=owner_id)
+    except Exception as e:  # noqa: BLE001
+        log.exception("ensure_desktop failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool
+async def acquire_desktop(
+    geometry: str = DEFAULT_GEOMETRY,
+    owner_id: str = "",
+    force_new: bool = False,
+) -> dict:
+    """Acquire a desktop session (multi-agent aware).
+
+    Linux: by default same as ensure_desktop (reuse own lease or spawn if busy).
+    force_new=True always spawns a fresh exclusive Xvnc seat.
+    macOS: returns the single real logged-in session (no second Xvnc).
+
+    Returns {session_id, display, novnc_url, geometry, owner_id, lease_until, ...}.
+    """
+    try:
+        return await BACKEND.acquire_desktop(geometry, owner_id=owner_id, force_new=force_new)
     except Exception as e:  # noqa: BLE001
         log.exception("acquire_desktop failed")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @mcp.tool
+async def heartbeat_desktop(session_id: str, owner_id: str = "") -> dict:
+    """Refresh the exclusive lease TTL so the idle reaper will not free this session.
+
+    Call periodically during long runs, or after idle gaps, while still using the desktop.
+    """
+    try:
+        return await BACKEND.heartbeat_desktop(session_id, owner_id=owner_id)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool
 async def release_desktop(session_id: str) -> dict:
-    """Release a session.
+    """Release a session: free the exclusive lock and stop pool VNC processes.
 
     Linux: kill the Xvnc + WM + websockify and free its ports.
     macOS: tear down only the noVNC bridge — the user session is never terminated.
+    Call on agent stop / task end.
     """
     try:
         return await BACKEND.release_desktop(session_id)
@@ -1430,9 +2068,22 @@ async def release_desktop(session_id: str) -> dict:
 
 @mcp.tool
 async def list_desktops() -> dict:
-    """Return all active sessions in the pool."""
+    """Return all active sessions in the pool (reaps dead/idle seats first)."""
     try:
         return await BACKEND.list_desktops()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool
+async def reap_idle_desktops() -> dict:
+    """Free locks and stop VNC for lease-expired or dead pool sessions.
+
+    Reduces host load when agents crash, stop, or go idle past DESKTOP_ACT_LEASE_TTL.
+    Does not touch the host default display (e.g. reauth Chrome on :1).
+    """
+    try:
+        return await BACKEND.reap_idle_desktops()
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -1506,9 +2157,7 @@ async def act(
             "log_path": str(log_path),
         }
     except Exception as e:  # noqa: BLE001
-        log_path.write_text(
-            "\n---\n".join(chunks) + f"\n\n*** ERROR {type(e).__name__}: {e} ***"
-        )
+        log_path.write_text("\n---\n".join(chunks) + f"\n\n*** ERROR {type(e).__name__}: {e} ***")
         return {
             "ok": False,
             "error": f"{type(e).__name__}: {e}",
@@ -1565,12 +2214,19 @@ async def status() -> dict:
         "log_dir": str(LOG_DIR),
         "binaries": {k: v or "MISSING" for k, v in BIN.items()},
         "pool_size": len(pool),
+        "default_geometry": DEFAULT_GEOMETRY,
+        "lease_ttl_sec": LEASE_TTL_SEC,
+        "reap_interval_sec": REAP_INTERVAL_SEC,
+        "auto_spawn": AUTO_SPAWN,
         "pool_sessions": [
             {
                 "session_id": s["session_id"],
                 "display": s["display"],
                 "novnc_url": s.get("novnc_url"),
                 "geometry": s["geometry"],
+                "owner_id": s.get("owner_id") or "",
+                "lease_until": s.get("lease_until") or 0,
+                "lease_expired": _lease_expired(s),
                 # Per-session liveness via the active backend (not a blanket probe).
                 "alive": BACKEND._session_alive(s),  # type: ignore[attr-defined]
             }
@@ -1584,11 +2240,105 @@ async def status() -> dict:
     }
 
 
+def _start_idle_reaper() -> None:
+    """Background thread: free locks + kill idle/dead pool VNC stacks."""
+    if REAP_INTERVAL_SEC <= 0 or not REAP_ON_IDLE:
+        log.info(
+            "idle reaper disabled (REAP_INTERVAL=%s REAP_ON_IDLE=%s)",
+            REAP_INTERVAL_SEC,
+            REAP_ON_IDLE,
+        )
+        return
+
+    def _loop() -> None:
+        while True:
+            try:
+                time.sleep(max(5, REAP_INTERVAL_SEC))
+                if hasattr(BACKEND, "reap_idle_desktops"):
+                    # Sync path via asyncio.run is heavy; call locked reap when available.
+                    if hasattr(BACKEND, "_reap_pool_locked"):
+                        with _PoolLock():
+                            pool = _read_pool()
+                            reaped = BACKEND._reap_pool_locked(pool, reason="bg-idle")  # type: ignore[attr-defined]
+                        if reaped:
+                            log.info("bg reaper removed %d session(s)", len(reaped))
+                    else:
+                        # macOS: use async tool path via new event loop
+                        try:
+                            asyncio.run(BACKEND.reap_idle_desktops())  # type: ignore[misc]
+                        except Exception:  # noqa: BLE001
+                            pass
+            except Exception as e:  # noqa: BLE001
+                log.warning("idle reaper tick failed: %s", e)
+
+    t = threading.Thread(target=_loop, name="desktop-act-reaper", daemon=True)
+    t.start()
+    log.info(
+        "idle reaper started interval=%ss lease_ttl=%ss",
+        REAP_INTERVAL_SEC,
+        LEASE_TTL_SEC,
+    )
+
+
+def _shutdown_owned_sessions() -> None:
+    """On process exit / signal: release sessions owned by this process or owner id."""
+    owner = _default_owner_id()
+    pid = os.getpid()
+    try:
+        with _PoolLock():
+            pool = _read_pool()
+            to_release = [
+                sid
+                for sid, s in pool.items()
+                if (s.get("owner_id") or "") == owner or int(s.get("owner_pid") or 0) == pid
+            ]
+            for sid in to_release:
+                if hasattr(BACKEND, "_release_locked"):
+                    BACKEND._release_locked(pool, sid)  # type: ignore[attr-defined]
+                    log.info("shutdown released session %s", sid)
+                else:
+                    # mac: clear lease + bridge only
+                    s = pool.get(sid)
+                    if s:
+                        _clear_lease(s)
+                        pool[sid] = s
+            if to_release and not hasattr(BACKEND, "_release_locked"):
+                _write_pool(pool)
+    except Exception as e:  # noqa: BLE001
+        log.warning("shutdown release failed: %s", e)
+
+
+def _install_signal_handlers() -> None:
+    if RELEASE_ON_EXIT:
+        atexit.register(_shutdown_owned_sessions)
+    else:
+        log.info("RELEASE_ON_EXIT=0 — atexit will not free pool desktops (CLI mode)")
+
+    def _handle(signum, _frame):  # type: ignore[no-untyped-def]
+        log.info("signal %s — releasing owned desktops", signum)
+        if RELEASE_ON_EXIT:
+            _shutdown_owned_sessions()
+        # Re-raise default for SIGTERM/SIGINT so the process exits.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handle)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+_start_idle_reaper()
+_install_signal_handlers()
+
 if __name__ == "__main__":
     log.info(
-        "desktop-act MCP starting — backend=%s pool=%s default_display=%s",
+        "desktop-act MCP starting — backend=%s pool=%s default_display=%s geometry=%s lease_ttl=%ss",
         BACKEND.name,
         POOL_PATH,
         DEFAULT_DISPLAY,
+        DEFAULT_GEOMETRY,
+        LEASE_TTL_SEC,
     )
     mcp.run()

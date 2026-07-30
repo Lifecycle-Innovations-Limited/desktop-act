@@ -126,7 +126,13 @@ All knobs are environment variables — no config file required.
 | `DESKTOP_ACT_DISPLAY_MIN`/`MAX`  | `50` / `99`                     | Pool display number range               |
 | `DESKTOP_ACT_VNC_PORT_BASE`      | `5900`                          | Pool VNC port base (display N → 5900+N) |
 | `DESKTOP_ACT_NOVNC_PORT_BASE`    | `6082`                          | noVNC websockify port base              |
-| `DESKTOP_ACT_GEOMETRY`           | `1280x800`                      | Default geometry for new desktops       |
+| `DESKTOP_ACT_GEOMETRY`           | `2560x1440`                     | Default geometry for new desktops       |
+| `DESKTOP_ACT_OWNER`              | (process/agent id)              | Exclusive lease owner id                |
+| `DESKTOP_ACT_LEASE_TTL`          | `600`                           | Lease seconds; idle past this → reaped  |
+| `DESKTOP_ACT_REAP_INTERVAL`      | `30`                            | Background reaper tick (0 = off)        |
+| `DESKTOP_ACT_REAP_ON_IDLE`       | `1`                             | Free lock + stop VNC when lease expires |
+| `DESKTOP_ACT_AUTO_SPAWN`         | `1`                             | Spawn new desktop if others are busy    |
+| `DESKTOP_ACT_RELEASE_ON_EXIT`    | `1` (CLI forces `0`)            | Free owned pool seats when process ends |
 | `DESKTOP_ACT_TMP`                | `/tmp`                          | Where pool state + screenshots live     |
 | `DESKTOP_ACT_LOG_DIR`            | `$CLAUDE_PLUGIN_ROOT/logs`      | Where session logs go                   |
 | `DESKTOP_ACT_VENV`               | `$CLAUDE_PLUGIN_ROOT/.venv`     | Venv location                           |
@@ -143,11 +149,42 @@ Let the parent session drive the loop — call primitives, Read screenshots,
 decide, repeat. Every action is visible in the chat transcript.
 
 ```text
-mcp__desktop-act__acquire_desktop()                  # → session_id
+mcp__desktop-act__ensure_desktop(owner_id="agent-a") # → exclusive session_id
 mcp__desktop-act__launch_app(session_id, "firefox")
 mcp__desktop-act__screenshot(session_id)             # → /tmp/desktop-act-shots/…jpg
 mcp__desktop-act__click(session_id, 640, 400)
-mcp__desktop-act__release_desktop(session_id)        # always, even on errors
+mcp__desktop-act__heartbeat_desktop(session_id)      # keep lease during long work
+mcp__desktop-act__release_desktop(session_id)        # always on agent stop
+```
+
+### Multi-agent (concurrent desktops)
+
+Each agent must use its own `owner_id` (or set `DESKTOP_ACT_OWNER`):
+
+1. `ensure_desktop(owner_id=…)` reuses that agent's lease, or **auto-spawns** a new
+   Xvnc + noVNC on the next free display/port if every seat is leased.
+2. Leases expire after `DESKTOP_ACT_LEASE_TTL` (default 600s) without heartbeat.
+3. Background reaper (every `DESKTOP_ACT_REAP_INTERVAL`) and process exit/SIGTERM:
+   **free the lock and stop pool VNC** (Xvnc + websockify) so idle seats do not
+   thrash the host. The host default display (e.g. reauth Chrome on `:1`) is never
+   reaped — only pool sessions (`:50`–`:99`).
+
+```text
+# Agent A
+ensure_desktop(owner_id="agent-a", geometry="2560x1440")  # → :50
+# Agent B (while A still holds :50)
+ensure_desktop(owner_id="agent-b", geometry="2560x1440")  # → :51 auto-spawn
+# Agent A stops / idle past TTL
+release_desktop / reaper → free lock, kill VNC on :50
+```
+
+CLI:
+
+```bash
+./cli/desktop-act ensure --owner-id agent-a --geometry 2560x1440
+./cli/desktop-act heartbeat --session-id desk-… --owner-id agent-a
+./cli/desktop-act reap
+./cli/desktop-act release --session-id desk-…
 ```
 
 ### Autonomous goal loop
@@ -197,9 +234,10 @@ http://<box-host>:6083   # second, etc.
 - **Persistent X11 connections.** One `Xlib.Display` per display name, cached
   for the life of the MCP process. Saves the connection-establishment hit per
   primitive call.
-- **File-locked pool.** Pool state lives at `/tmp/desktop-act-pool.json`,
-  guarded by `flock` on `/tmp/desktop-act-pool.lock`. Safe across
-  concurrent agents.
+- **File-locked pool + exclusive leases.** Pool state lives at
+  `/tmp/desktop-act-pool.json`, guarded by `flock` on
+  `/tmp/desktop-act-pool.lock`. Each session carries `owner_id` + `lease_until`.
+  Busy seats auto-spawn; idle/dead seats are reaped (lock free + VNC stop).
 - **SHA-deduped screenshots.** Identical frames return the same path without
   re-encoding. Keeps token/byte cost down across tight loops.
 - **JPEG by default.** Switch to PNG with `fmt="png"` when you need lossless.
