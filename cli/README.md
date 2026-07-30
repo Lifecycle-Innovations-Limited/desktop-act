@@ -53,12 +53,15 @@ Optional:
 | `which` | Print resolved server launch command |
 | `status` | Health + pool + binary inventory |
 | `list` | Active pool sessions |
-| `acquire` | Spawn / attach a desktop |
+| `ensure [--owner-id ID]` | Multi-agent: reuse lease or auto-spawn |
+| `acquire [--owner-id ID] [--force-new]` | Ensure by default; force-new always spawns |
+| `heartbeat --session-id ID` | Refresh lease TTL (avoid idle reap) |
+| `reap` | Free locks + stop VNC for idle/dead seats |
 | `release --session-id ID` | Tear down a session |
 | `screenshot [--session-id ID]` | Capture frame |
 | `observe [--session-id ID]` | Screenshot + windows |
 | `act --goal "…"` | Autonomous loop (`max_iterations`, not `max_steps`) |
-| `run --goal "…"` | Acquire → act → release |
+| `run --goal "…"` | Ensure → act → release |
 | `call TOOL --arg k=v` | Raw `tools/call` |
 
 Exit codes: `0` success, `1` act reported failure, `2` usage / transport error.
