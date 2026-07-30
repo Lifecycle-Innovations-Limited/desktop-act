@@ -1963,7 +1963,14 @@ class WinBackend:
         await asyncio.get_event_loop().run_in_executor(
             None, lambda: self._click_impl(int(x), int(y), int(button), bool(double))
         )
-        return {"ok": True, "x": x, "y": y, "button": button, "double": double, "display": "win:main"}
+        return {
+            "ok": True,
+            "x": x,
+            "y": y,
+            "button": button,
+            "double": double,
+            "display": "win:main",
+        }
 
     async def type_text(self, text, session_id, delay_ms) -> dict:
         if not IS_WIN:
