@@ -5,6 +5,8 @@ Architecture:
   * OS-agnostic backend abstraction dispatched on platform.system():
       - X11Backend (Linux): persistent Xlib connection cache + Xvnc/websockify pool.
       - MacBackend (macOS): screencapture + cliclick/osascript, single real session.
+      - WinBackend (Windows): Pillow ImageGrab + pyautogui/ctypes SendInput,
+        EnumWindows, single interactive desktop (lease model matches macOS).
   * Multi-desktop pool (Xvnc + websockify) with file-locked allocation in /tmp (X11).
   * Optimized primitives: cached SHA-dedupe screenshots, JPEG default, batch syncs.
   * High-level act(goal) via claude-agent-sdk (CLI OAuth, no ANTHROPIC_API_KEY).
@@ -64,7 +66,10 @@ POOL_LOCK = TMP_ROOT / "desktop-act-pool.lock"
 SESSIONS_DIR = TMP_ROOT / "desktop-act-sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_DISPLAY: str = os.environ.get("DESKTOP_ACT_DISPLAY", "mac:main" if IS_MAC else ":1")
+DEFAULT_DISPLAY: str = os.environ.get(
+    "DESKTOP_ACT_DISPLAY",
+    "mac:main" if IS_MAC else ("win:main" if IS_WIN else ":1"),
+)
 DISPLAY_NUM_MIN: int = int(os.environ.get("DESKTOP_ACT_DISPLAY_MIN", "50"))
 DISPLAY_NUM_MAX: int = int(os.environ.get("DESKTOP_ACT_DISPLAY_MAX", "99"))
 VNC_PORT_BASE: int = int(os.environ.get("DESKTOP_ACT_VNC_PORT_BASE", "5900"))
@@ -1573,77 +1578,475 @@ class MacBackend:
         return {"ok": True, "count": len(sessions), "sessions": sessions}
 
 
-# ─── Windows backend (limited / hybrid) ──────────────────────────────────────
+# ─── Windows backend (native desktop — single interactive session) ───────────
 class WinBackend:
-    """Windows backend stub — server starts; native automation is partial.
+    """Windows native computer-use backend (single interactive desktop).
 
-    Pool multi-desktop (Xvnc) is Linux-only. On Windows, ensure/acquire return a
-    stable pseudo-session and clear guidance to use browser tools (Playwright /
-    CDP) for GUI work until a native backend ships. Lease/reap APIs still work
-    as no-ops so multi-agent callers stay portable.
+    Multi-desktop Xvnc pools are Linux-only. On Windows we drive the real
+    logged-in session with the same tool signatures:
+
+    - screenshot: Pillow ImageGrab (GDI)
+    - click / type / keypress / scroll: pyautogui (optional) or ctypes SendInput
+    - list_windows: user32 EnumWindows
+    - launch_app: subprocess / os.startfile
+
+    Multi-agent: exclusive leases still apply, but there is only one real
+    desktop (shared warning if another owner holds the lease) — same model
+    as macOS.
     """
 
     name = "windows"
+    WIN_SESSION_ID = "win-main"
+
+    # Virtual-key map for common keypress names (subset of X11-style names).
+    _VK = {
+        "return": 0x0D,
+        "enter": 0x0D,
+        "tab": 0x09,
+        "escape": 0x1B,
+        "esc": 0x1B,
+        "backspace": 0x08,
+        "delete": 0x2E,
+        "space": 0x20,
+        "up": 0x26,
+        "down": 0x28,
+        "left": 0x25,
+        "right": 0x27,
+        "home": 0x24,
+        "end": 0x23,
+        "page_up": 0x21,
+        "page_down": 0x22,
+        "f1": 0x70,
+        "f2": 0x71,
+        "f3": 0x72,
+        "f4": 0x73,
+        "f5": 0x74,
+        "f6": 0x75,
+        "f7": 0x76,
+        "f8": 0x77,
+        "f9": 0x78,
+        "f10": 0x79,
+        "f11": 0x7A,
+        "f12": 0x7B,
+    }
+    _MOD_VK = {
+        "control": 0x11,
+        "ctrl": 0x11,
+        "alt": 0x12,
+        "shift": 0x10,
+        "win": 0x5B,
+        "meta": 0x5B,
+        "super": 0x5B,
+        "cmd": 0x5B,
+    }
 
     def __init__(self) -> None:
         self._session: dict = {
-            "session_id": "win-main",
+            "session_id": self.WIN_SESSION_ID,
             "display": "win:main",
             "geometry": DEFAULT_GEOMETRY,
             "novnc_url": None,
             "created_at": _now(),
-            "limited": True,
+            "limited": False,
             "platform_note": (
-                "Windows: desktop-act pool VNC is Linux-only. "
-                "Use browser automation for GUI; ensure_desktop is lease-only here."
+                "Windows native backend: single interactive desktop "
+                "(no Xvnc multi-seat pool). Requires an interactive session; "
+                "RDP/headless may need 'console' session."
             ),
         }
+        self._pyautogui = None
+        if IS_WIN:
+            try:
+                import pyautogui  # type: ignore
+
+                pyautogui.FAILSAFE = False
+                pyautogui.PAUSE = 0.02
+                self._pyautogui = pyautogui
+            except Exception as e:  # noqa: BLE001
+                log.warning("pyautogui unavailable (%s) — using ctypes SendInput", e)
 
     def _resolve_display(self, session_id: str = "") -> str:
+        if session_id and session_id not in ("", self.WIN_SESSION_ID):
+            # Unknown pool ids are rejected so agents notice they are on Windows.
+            pool = _read_pool()
+            if session_id not in pool and session_id != self.WIN_SESSION_ID:
+                raise ValueError(
+                    f"unknown session_id: {session_id} "
+                    f"(Windows has a single session: {self.WIN_SESSION_ID!r})"
+                )
         return "win:main"
 
     @staticmethod
     def _session_alive(sess: dict) -> bool:
         return True
 
-    def _limited(self, op: str) -> dict:
+    def _screen_size(self) -> tuple[int, int]:
+        if self._pyautogui is not None:
+            sz = self._pyautogui.size()
+            return int(sz.width), int(sz.height)
+        import ctypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+
+    def _take_screenshot(
+        self,
+        region: str = "",
+        fmt: str = "jpeg",
+        max_width: int = 0,
+        use_cache: bool = True,
+    ) -> dict:
+        from PIL import ImageGrab
+
+        t0 = time.time()
+        bbox = None
+        if region:
+            parts = [int(x.strip()) for x in region.split(",")]
+            if len(parts) == 4:
+                x, y, w, h = parts
+                bbox = (x, y, x + w, y + h)
+        img = ImageGrab.grab(bbox=bbox, all_screens=True)
+        path, meta = _encode_screenshot(img, fmt=fmt, max_width=max_width, use_cache=use_cache)
+        w, h = self._screen_size()
         return {
-            "ok": False,
-            "error": f"{op} not available on Windows native backend yet",
-            "hint": self._session["platform_note"],
-            "platform": "Windows",
+            "ok": True,
+            "path": str(path),
+            "display": "win:main",
+            "width": meta.get("width") or img.width,
+            "height": meta.get("height") or img.height,
+            "screen": f"{w}x{h}",
+            "sha": meta.get("sha"),
+            "cached": meta.get("cached", False),
+            "ms": int((time.time() - t0) * 1000),
         }
 
+    def _sendinput_mouse(self, flags: int, dx: int = 0, dy: int = 0, data: int = 0) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", wintypes.LONG),
+                ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        class INPUT(ctypes.Structure):
+            class _I(ctypes.Union):
+                _fields_ = [("mi", MOUSEINPUT)]
+
+            _anonymous_ = ("i",)
+            _fields_ = [("type", wintypes.DWORD), ("i", _I)]
+
+        inp = INPUT()
+        inp.type = 0  # INPUT_MOUSE
+        inp.mi = MOUSEINPUT(dx, dy, data, flags, 0, None)
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))  # type: ignore[attr-defined]
+
+    def _sendinput_key(self, vk: int, up: bool = False) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        class INPUT(ctypes.Structure):
+            class _I(ctypes.Union):
+                _fields_ = [("ki", KEYBDINPUT)]
+
+            _anonymous_ = ("i",)
+            _fields_ = [("type", wintypes.DWORD), ("i", _I)]
+
+        KEYEVENTF_KEYUP = 0x0002
+        inp = INPUT()
+        inp.type = 1  # INPUT_KEYBOARD
+        inp.ki = KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP if up else 0, 0, None)
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))  # type: ignore[attr-defined]
+
+    def _click_impl(self, x: int, y: int, button: int = 1, double: bool = False) -> None:
+        if self._pyautogui is not None:
+            btn = {1: "left", 2: "middle", 3: "right"}.get(button, "left")
+            clicks = 2 if double else 1
+            self._pyautogui.click(x=x, y=y, button=btn, clicks=clicks)
+            return
+        import ctypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        user32.SetCursorPos(int(x), int(y))
+        down_up = {
+            1: (0x0002, 0x0004),  # LEFTDOWN/UP
+            2: (0x0020, 0x0040),  # MIDDLE
+            3: (0x0008, 0x0010),  # RIGHT
+        }.get(button, (0x0002, 0x0004))
+        n = 2 if double else 1
+        for _ in range(n):
+            self._sendinput_mouse(down_up[0])
+            self._sendinput_mouse(down_up[1])
+            time.sleep(0.03)
+
+    def _type_impl(self, text: str, delay_ms: int = 5) -> None:
+        if self._pyautogui is not None:
+            # interval in seconds
+            self._pyautogui.write(text, interval=max(0.0, delay_ms / 1000.0))
+            return
+        # Fallback: clipboard paste for reliability with unicode
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            CF_UNICODETEXT = 13
+            GMEM_MOVEABLE = 0x0002
+            data = text.encode("utf-16-le") + b"\x00\x00"
+            user32.OpenClipboard(0)
+            user32.EmptyClipboard()
+            h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+            ptr = kernel32.GlobalLock(h)
+            ctypes.memmove(ptr, data, len(data))
+            kernel32.GlobalUnlock(h)
+            user32.SetClipboardData(CF_UNICODETEXT, h)
+            user32.CloseClipboard()
+            # Ctrl+V
+            self._sendinput_key(0x11, up=False)  # VK_CONTROL
+            self._sendinput_key(0x56, up=False)  # V
+            self._sendinput_key(0x56, up=True)
+            self._sendinput_key(0x11, up=True)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"type_text failed without pyautogui: {e}") from e
+
+    def _keypress_impl(self, key: str, modifiers: Optional[list[str]] = None) -> None:
+        mods = [m.lower() for m in (modifiers or [])]
+        k = (key or "").lower()
+        if self._pyautogui is not None:
+            keys = []
+            for m in mods:
+                if m in ("control", "ctrl"):
+                    keys.append("ctrl")
+                elif m in ("alt",):
+                    keys.append("alt")
+                elif m in ("shift",):
+                    keys.append("shift")
+                elif m in ("win", "meta", "super", "cmd"):
+                    keys.append("win")
+            # map common names
+            pg_map = {
+                "return": "enter",
+                "escape": "esc",
+                "page_up": "pageup",
+                "page_down": "pagedown",
+            }
+            keys.append(pg_map.get(k, k))
+            self._pyautogui.hotkey(*keys) if len(keys) > 1 else self._pyautogui.press(keys[0])
+            return
+        held = [self._MOD_VK[m] for m in mods if m in self._MOD_VK]
+        vk = self._VK.get(k)
+        if vk is None and len(k) == 1:
+            import ctypes
+
+            vk = ctypes.windll.user32.VkKeyScanW(ord(k)) & 0xFF  # type: ignore[attr-defined]
+        if vk is None:
+            raise ValueError(f"unsupported key on Windows: {key!r}")
+        for m in held:
+            self._sendinput_key(m, up=False)
+        self._sendinput_key(vk, up=False)
+        self._sendinput_key(vk, up=True)
+        for m in reversed(held):
+            self._sendinput_key(m, up=True)
+
+    def _scroll_impl(self, direction: str, amount: int, x: int, y: int) -> None:
+        if x >= 0 and y >= 0:
+            if self._pyautogui is not None:
+                self._pyautogui.moveTo(x, y)
+            else:
+                import ctypes
+
+                ctypes.windll.user32.SetCursorPos(int(x), int(y))  # type: ignore[attr-defined]
+        d = (direction or "down").lower()
+        if self._pyautogui is not None:
+            if d == "up":
+                self._pyautogui.scroll(amount)
+            elif d == "down":
+                self._pyautogui.scroll(-amount)
+            elif d == "left":
+                self._pyautogui.hscroll(-amount)
+            else:
+                self._pyautogui.hscroll(amount)
+            return
+        # MOUSEEVENTF_WHEEL = 0x0800, HWHEEL = 0x01000; data is wheel delta * 120
+        WHEEL = 0x0800
+        HWHEEL = 0x01000
+        delta = 120 * int(amount)
+        if d == "up":
+            self._sendinput_mouse(WHEEL, data=delta)
+        elif d == "down":
+            self._sendinput_mouse(WHEEL, data=-delta)
+        elif d == "left":
+            self._sendinput_mouse(HWHEEL, data=-delta)
+        else:
+            self._sendinput_mouse(HWHEEL, data=delta)
+
+    def _list_windows_impl(self) -> list[dict]:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        EnumWindows = user32.EnumWindows
+        IsWindowVisible = user32.IsWindowVisible
+        GetWindowTextLengthW = user32.GetWindowTextLengthW
+        GetWindowTextW = user32.GetWindowTextW
+        GetWindowRect = user32.GetWindowRect
+        GetClassNameW = user32.GetClassNameW
+
+        results: list[dict] = []
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", wintypes.LONG),
+                ("top", wintypes.LONG),
+                ("right", wintypes.LONG),
+                ("bottom", wintypes.LONG),
+            ]
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _lparam):  # type: ignore[misc]
+            if not IsWindowVisible(hwnd):
+                return True
+            n = GetWindowTextLengthW(hwnd)
+            if n <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(n + 1)
+            GetWindowTextW(hwnd, buf, n + 1)
+            title = buf.value.strip()
+            if not title:
+                return True
+            rect = RECT()
+            GetWindowRect(hwnd, ctypes.byref(rect))
+            cls = ctypes.create_unicode_buffer(256)
+            GetClassNameW(hwnd, cls, 256)
+            results.append(
+                {
+                    "name": title,
+                    "class": cls.value,
+                    "x": int(rect.left),
+                    "y": int(rect.top),
+                    "w": int(rect.right - rect.left),
+                    "h": int(rect.bottom - rect.top),
+                    "hwnd": int(hwnd),
+                }
+            )
+            return True
+
+        EnumWindows(_cb, 0)
+        return results
+
     async def screenshot(self, session_id, region, fmt, max_width, use_cache) -> dict:
-        return self._limited("screenshot")
+        if not IS_WIN:
+            return {"ok": False, "error": "WinBackend only runs on Windows"}
+        self._resolve_display(session_id)
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self._take_screenshot(region, fmt, max_width, use_cache)
+        )
 
     async def click(self, x, y, button, double, session_id) -> dict:
-        return self._limited("click")
+        if not IS_WIN:
+            return {"ok": False, "error": "WinBackend only runs on Windows"}
+        self._resolve_display(session_id)
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self._click_impl(int(x), int(y), int(button), bool(double))
+        )
+        return {"ok": True, "x": x, "y": y, "button": button, "double": double, "display": "win:main"}
 
     async def type_text(self, text, session_id, delay_ms) -> dict:
-        return self._limited("type_text")
+        if not IS_WIN:
+            return {"ok": False, "error": "WinBackend only runs on Windows"}
+        self._resolve_display(session_id)
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self._type_impl(text, int(delay_ms))
+        )
+        return {"ok": True, "chars": len(text or ""), "display": "win:main"}
 
     async def keypress(self, key, modifiers, session_id) -> dict:
-        return self._limited("keypress")
+        if not IS_WIN:
+            return {"ok": False, "error": "WinBackend only runs on Windows"}
+        self._resolve_display(session_id)
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self._keypress_impl(key, modifiers)
+        )
+        return {"ok": True, "key": key, "modifiers": modifiers or [], "display": "win:main"}
 
     async def scroll(self, direction, amount, x, y, session_id) -> dict:
-        return self._limited("scroll")
+        if not IS_WIN:
+            return {"ok": False, "error": "WinBackend only runs on Windows"}
+        self._resolve_display(session_id)
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self._scroll_impl(direction, int(amount), int(x), int(y))
+        )
+        return {
+            "ok": True,
+            "direction": direction,
+            "amount": amount,
+            "display": "win:main",
+        }
 
     async def list_windows(self, session_id) -> dict:
-        return {"ok": True, "windows": [], "display": "win:main", "limited": True}
+        if not IS_WIN:
+            return {"ok": True, "windows": [], "display": "win:main", "note": "not on Windows"}
+        self._resolve_display(session_id)
+        wins = await asyncio.get_event_loop().run_in_executor(None, self._list_windows_impl)
+        return {"ok": True, "windows": wins, "display": "win:main", "count": len(wins)}
 
     async def launch_app(self, command, session_id) -> dict:
-        return self._limited("launch_app")
+        if not IS_WIN:
+            return {"ok": False, "error": "WinBackend only runs on Windows"}
+        self._resolve_display(session_id)
+        cmd = (command or "").strip()
+        if not cmd:
+            return {"ok": False, "error": "empty command"}
+        try:
+            # Prefer startfile for apps/paths; fall back to shell.
+            if os.path.exists(cmd) or cmd.lower().endswith((".exe", ".bat", ".cmd", ".lnk")):
+                os.startfile(cmd)  # type: ignore[attr-defined]
+                return {"ok": True, "command": cmd, "method": "startfile", "display": "win:main"}
+            proc = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return {
+                "ok": True,
+                "command": cmd,
+                "pid": proc.pid,
+                "method": "shell",
+                "display": "win:main",
+            }
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(e).__name__}: {e}", "command": cmd}
 
     async def ensure_desktop(self, geometry: str = DEFAULT_GEOMETRY, owner_id: str = "") -> dict:
         owner = (owner_id or "").strip() or _default_owner_id()
         geo = geometry or DEFAULT_GEOMETRY
+        w, h = (0, 0)
+        if IS_WIN:
+            try:
+                w, h = self._screen_size()
+                geo = f"{w}x{h}"
+            except Exception:  # noqa: BLE001
+                pass
         with _PoolLock():
             pool = _read_pool()
-            prev = pool.get("win-main") or {}
+            prev = pool.get(self.WIN_SESSION_ID) or {}
             if prev and _lease_held_by_other(prev, owner):
-                # No second real desktop on Windows either — surface share warning.
-                out = {
+                return {
                     **dict(self._session),
                     **prev,
                     "geometry": prev.get("geometry") or geo,
@@ -1651,48 +2054,55 @@ class WinBackend:
                     "reused": True,
                     "spawned": False,
                     "shared": True,
-                    "limited": True,
                     "warning": (
-                        "Windows has no pool VNC; another owner holds the lease. "
-                        + (self._session.get("platform_note") or "")
+                        "Windows has a single interactive desktop; "
+                        "another owner holds the exclusive lease."
                     ),
                     "other_owner": prev.get("owner_id"),
                 }
-                return out
             s = dict(self._session)
             _apply_lease(s, owner)
             s["geometry"] = geo
             s["owner_pid"] = os.getpid()
-            pool["win-main"] = s
+            s["limited"] = False
+            if w and h:
+                s["screen"] = f"{w}x{h}"
+            pool[self.WIN_SESSION_ID] = s
             _write_pool(pool)
         return {
             "ok": True,
-            "reused": True,
+            "reused": bool(prev),
             "spawned": False,
-            "limited": True,
+            "limited": False,
             **s,
-            "warning": s["platform_note"],
         }
 
     async def acquire_desktop(
         self, geometry: str = DEFAULT_GEOMETRY, owner_id: str = "", force_new: bool = False
     ) -> dict:
+        # force_new is a no-op: Windows cannot spawn a second interactive desktop.
         return await self.ensure_desktop(geometry, owner_id=owner_id)
 
     async def heartbeat_desktop(self, session_id: str, owner_id: str = "") -> dict:
         owner = (owner_id or "").strip() or _default_owner_id()
         with _PoolLock():
             pool = _read_pool()
-            s = pool.get(session_id) or dict(self._session)
+            s = pool.get(session_id) or pool.get(self.WIN_SESSION_ID) or dict(self._session)
+            if _lease_held_by_other(s, owner):
+                return {
+                    "ok": False,
+                    "error": "lease held by another owner",
+                    "owner_id": s.get("owner_id"),
+                    "lease_until": s.get("lease_until"),
+                }
             _apply_lease(s, owner)
-            pool[s["session_id"]] = s
+            pool[s.get("session_id") or self.WIN_SESSION_ID] = s
             _write_pool(pool)
             return {
                 "ok": True,
-                "session_id": s["session_id"],
+                "session_id": s.get("session_id") or self.WIN_SESSION_ID,
                 "owner_id": s.get("owner_id"),
                 "lease_until": s.get("lease_until"),
-                "limited": True,
             }
 
     async def release_desktop(self, session_id: str) -> dict:
@@ -1705,14 +2115,15 @@ class WinBackend:
             "ok": True,
             "released": session_id,
             "killed": [],
-            "note": "Windows: no VNC pool to tear down",
-            "limited": True,
+            "note": "Windows: interactive session kept; lease only released",
         }
 
     async def list_desktops(self) -> dict:
         pool = _read_pool()
-        sessions = [{**s, "alive": True, "limited": True} for s in pool.values()]
-        return {"ok": True, "count": len(sessions), "sessions": sessions, "limited": True}
+        sessions = [{**s, "alive": True} for s in pool.values()]
+        if not sessions:
+            sessions = [{**self._session, "alive": True}]
+        return {"ok": True, "count": len(sessions), "sessions": sessions}
 
     async def reap_idle_desktops(self) -> dict:
         reaped: list[dict] = []
@@ -1725,7 +2136,13 @@ class WinBackend:
                     reaped.append({"session_id": sid, "reason": "lease_expired"})
             if reaped:
                 _write_pool(pool)
-        return {"ok": True, "reaped": reaped, "count": len(reaped), "remaining": len(_read_pool())}
+        return {
+            "ok": True,
+            "reaped": reaped,
+            "count": len(reaped),
+            "remaining": len(_read_pool()),
+            "note": "Windows: lease metadata only (no VNC process teardown)",
+        }
 
 
 # ─── Backend dispatch ─────────────────────────────────────────────────────────
@@ -1748,10 +2165,12 @@ mcp = FastMCP(
     name="desktop-act",
     instructions=(
         "Computer-use primitives + multi-desktop pool + autonomous act() loop. "
-        "OS-agnostic: X11/Xvnc pool on Linux, screencapture + cliclick on macOS. "
+        "OS-agnostic: X11/Xvnc pool on Linux; screencapture+cliclick on macOS; "
+        "ImageGrab+pyautogui/SendInput on Windows (single interactive desktop). "
         "Multi-agent: call ensure_desktop(owner_id=…) — exclusive lease per agent; "
-        "if another agent holds a desktop, a new Xvnc auto-spawns on a free port. "
-        "Idle/lease-expired sessions are reaped (lock freed + VNC stopped). "
+        "on Linux, busy seats auto-spawn a new Xvnc; on macOS/Windows only one "
+        "real desktop exists (shared lease warning if another owner holds it). "
+        "Idle/lease-expired sessions are reaped (Linux also stops VNC). "
         "Pass session_id to primitives. Optimized: SHA-dedupe screenshot cache, JPEG default."
     ),
 )

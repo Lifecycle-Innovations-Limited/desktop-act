@@ -13,6 +13,10 @@ a backend is selected at startup from `platform.system()`:
 - **macOS (`MacBackend`):** `screencapture` for frames, `cliclick`/`osascript`
   for input, and the single real logged-in session (no Xvnc pool). Built-in
   Screen Sharing (VNC :5900) is bridged to noVNC via `websockify` when enabled.
+- **Windows (`WinBackend`):** Pillow `ImageGrab` for frames, `pyautogui` (or
+  ctypes `SendInput` fallback) for mouse/keyboard, `EnumWindows` for window
+  list, `os.startfile` / shell for launch. Single interactive desktop (lease
+  model matches macOS — no multi-seat VNC pool).
 
 All tool signatures and return shapes are identical across backends, so callers
 never need to know which platform they're on.
@@ -88,6 +92,30 @@ Grant both to the host process driving the MCP server (your terminal, Claude
 Code, etc.). For a live view, optionally enable **Screen Sharing** (System
 Settings → General → Sharing → Screen Sharing); `acquire_desktop` still returns
 a session without it and surfaces a `vnc_hint`.
+
+#### Windows (WinBackend)
+
+Runs against the **logged-in interactive session** (same machine the MCP host
+is on). No Xvnc pool — multi-agent exclusive leases still apply, but there is
+only one real desktop (`win-main`).
+
+```powershell
+# Python 3.10+ recommended; venv bootstrap pulls deps from requirements.txt
+py -3 -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
+# pyautogui is installed only on win32 (see requirements marker)
+```
+
+**Requirements / limits:**
+
+- An interactive desktop session (console or RDP with a real desktop). Pure
+  headless / Session 0 service accounts cannot drive GUI input.
+- Optional: install a browser or app you want `launch_app` to start
+  (`chrome`, `notepad`, path to `.exe` / `.lnk`).
+- `pyautogui` is preferred; if it is missing, WinBackend uses ctypes
+  `SendInput` + clipboard paste for `type_text`.
+- Multi-seat isolation is Linux-only. On Windows, concurrent agents share one
+  screen and must coordinate via leases (`ensure_desktop` / `heartbeat_desktop`).
 
 ---
 
@@ -226,18 +254,20 @@ http://<box-host>:6083   # second, etc.
 ## Architecture notes
 
 - **OS-agnostic backend.** A module-level `BACKEND` is chosen at startup from
-  `platform.system()` — `MacBackend` on macOS, `X11Backend` everywhere else.
-  Both implement the same `Backend` protocol; every `@mcp.tool` simply delegates
-  to `BACKEND.<method>`, so tool signatures and return shapes are identical
-  across platforms. `from Xlib import …` is imported lazily inside the X11
-  methods, so the module imports cleanly on macOS without python-xlib installed.
-- **Persistent X11 connections.** One `Xlib.Display` per display name, cached
-  for the life of the MCP process. Saves the connection-establishment hit per
-  primitive call.
-- **File-locked pool + exclusive leases.** Pool state lives at
-  `/tmp/desktop-act-pool.json`, guarded by `flock` on
-  `/tmp/desktop-act-pool.lock`. Each session carries `owner_id` + `lease_until`.
-  Busy seats auto-spawn; idle/dead seats are reaped (lock free + VNC stop).
+  `platform.system()` — `MacBackend` on macOS, `WinBackend` on Windows,
+  `X11Backend` on Linux. All three implement the same `Backend` protocol; every
+  `@mcp.tool` simply delegates to `BACKEND.<method>`, so tool signatures and
+  return shapes are identical across platforms. Platform-only imports
+  (`Xlib`, `ImageGrab`/`ctypes.windll`, Quartz) stay inside backend methods so
+  the module imports cleanly on any host.
+- **Persistent X11 connections (Linux).** One `Xlib.Display` per display name,
+  cached for the life of the MCP process. Saves the connection-establishment
+  hit per primitive call.
+- **File-locked pool + exclusive leases.** Pool state lives under
+  `$DESKTOP_ACT_TMP` (default `/tmp` on Unix, `%TEMP%` on Windows), guarded by
+  `flock` / `msvcrt` locking. Each session carries `owner_id` + `lease_until`.
+  On Linux, busy seats auto-spawn Xvnc and idle seats are reaped (lock free +
+  VNC stop). On macOS/Windows the reaper clears lease metadata only.
 - **SHA-deduped screenshots.** Identical frames return the same path without
   re-encoding. Keeps token/byte cost down across tight loops.
 - **JPEG by default.** Switch to PNG with `fmt="png"` when you need lossless.

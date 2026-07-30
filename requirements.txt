@@ -15,3 +15,6 @@ pydantic_core==2.46.4
 # Linux-only: X11 primitives. On macOS the MacBackend uses system binaries
 # (screencapture, cliclick, osascript, open) and never imports Xlib.
 python-xlib==0.33; sys_platform == "linux"
+# Windows-only: optional high-level input. WinBackend falls back to ctypes
+# SendInput + clipboard paste if pyautogui is missing.
+pyautogui==0.9.54; sys_platform == "win32"
