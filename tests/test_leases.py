@@ -88,3 +88,12 @@ if __name__ == "__main__":
     test_default_owner_env()
     test_backend_name_matches_platform()
     print("ok")
+
+
+def test_pool_lock_roundtrip():
+    """Portable lock must enter/exit without error (fcntl or msvcrt)."""
+    with mod._PoolLock():
+        pool = mod._read_pool()
+        assert isinstance(pool, dict)
+        # Nested re-entry is not supported; just verify write under lock.
+        mod._write_pool(pool)

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import fcntl
 import hashlib
 import json
 import logging
@@ -43,19 +42,27 @@ PLUGIN_ROOT = Path(
     or os.environ.get("DESKTOP_ACT_ROOT")
     or Path(__file__).resolve().parent.parent
 )
+_SYS = platform.system().lower()
+IS_MAC: bool = _SYS == "darwin"
+IS_WIN: bool = _SYS.startswith("win")
+
 LOG_DIR = Path(os.environ.get("DESKTOP_ACT_LOG_DIR", PLUGIN_ROOT / "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-TMP_ROOT = Path(os.environ.get("DESKTOP_ACT_TMP", "/tmp"))
+# Prefer OS temp on Windows; Linux/mac keep /tmp for shared multi-agent pool paths.
+if os.environ.get("DESKTOP_ACT_TMP"):
+    TMP_ROOT = Path(os.environ["DESKTOP_ACT_TMP"])
+elif IS_WIN:
+    import tempfile as _tempfile
+
+    TMP_ROOT = Path(_tempfile.gettempdir())
+else:
+    TMP_ROOT = Path("/tmp")
 SHOT_DIR = TMP_ROOT / "desktop-act-shots"
 SHOT_DIR.mkdir(parents=True, exist_ok=True)
 POOL_PATH = TMP_ROOT / "desktop-act-pool.json"
 POOL_LOCK = TMP_ROOT / "desktop-act-pool.lock"
 SESSIONS_DIR = TMP_ROOT / "desktop-act-sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-
-_SYS = platform.system().lower()
-IS_MAC: bool = _SYS == "darwin"
-IS_WIN: bool = _SYS.startswith("win")
 
 DEFAULT_DISPLAY: str = os.environ.get("DESKTOP_ACT_DISPLAY", "mac:main" if IS_MAC else ":1")
 DISPLAY_NUM_MIN: int = int(os.environ.get("DESKTOP_ACT_DISPLAY_MIN", "50"))
@@ -162,7 +169,7 @@ if IS_MAC:
             "missing critical macOS binaries: %s — primitives will fail (brew install cliclick)",
             _missing_critical,
         )
-else:
+elif not IS_WIN:
     _missing_critical = [k for k in ("Xvnc", "websockify") if BIN[k] is None]
     if _missing_critical:
         log.warning("missing critical binaries: %s — pool spawn will fail", _missing_critical)
@@ -183,16 +190,46 @@ def _write_pool(pool: dict[str, dict]) -> None:
 
 
 class _PoolLock:
-    """Cross-process flock guard for pool mutations."""
+    """Cross-process exclusive lock for pool mutations.
+
+    Unix: fcntl.flock. Windows: msvcrt.locking on a 1-byte region (fcntl is
+    unavailable). Pool multi-desktop is Linux-primary; Windows only guards the
+    lease JSON for the limited hybrid backend.
+    """
 
     def __enter__(self):
-        self.fd = POOL_LOCK.open("w")
-        fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX)
+        # "a+" so the file exists and is readable for msvcrt byte locks.
+        self.fd = POOL_LOCK.open("a+")
+        if IS_WIN:
+            import msvcrt
+
+            self.fd.seek(0, os.SEEK_END)
+            if self.fd.tell() == 0:
+                self.fd.write("0")
+                self.fd.flush()
+            self.fd.seek(0)
+            # LK_LOCK blocks until the region is free.
+            msvcrt.locking(self.fd.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX)
         return self
 
     def __exit__(self, *exc):
         try:
-            fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+            if IS_WIN:
+                import msvcrt
+
+                self.fd.seek(0)
+                try:
+                    msvcrt.locking(self.fd.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                import fcntl
+
+                fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
         finally:
             self.fd.close()
 
@@ -1600,11 +1637,32 @@ class WinBackend:
 
     async def ensure_desktop(self, geometry: str = DEFAULT_GEOMETRY, owner_id: str = "") -> dict:
         owner = (owner_id or "").strip() or _default_owner_id()
-        s = dict(self._session)
-        _apply_lease(s, owner)
-        s["geometry"] = geometry or DEFAULT_GEOMETRY
+        geo = geometry or DEFAULT_GEOMETRY
         with _PoolLock():
             pool = _read_pool()
+            prev = pool.get("win-main") or {}
+            if prev and _lease_held_by_other(prev, owner):
+                # No second real desktop on Windows either — surface share warning.
+                out = {
+                    **dict(self._session),
+                    **prev,
+                    "geometry": prev.get("geometry") or geo,
+                    "ok": True,
+                    "reused": True,
+                    "spawned": False,
+                    "shared": True,
+                    "limited": True,
+                    "warning": (
+                        "Windows has no pool VNC; another owner holds the lease. "
+                        + (self._session.get("platform_note") or "")
+                    ),
+                    "other_owner": prev.get("owner_id"),
+                }
+                return out
+            s = dict(self._session)
+            _apply_lease(s, owner)
+            s["geometry"] = geo
+            s["owner_pid"] = os.getpid()
             pool["win-main"] = s
             _write_pool(pool)
         return {
