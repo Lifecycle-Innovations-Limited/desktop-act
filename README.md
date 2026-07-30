@@ -159,6 +159,22 @@ mcp__desktop-act__release_desktop(session_id)        # always, even on errors
 `act()` spawns a sub-session via `claude-agent-sdk`. Use this when you want
 hands-off; otherwise streaming primitives give better transparency.
 
+### Stdio CLI (no MCP host)
+
+For scripts, CI, or agents that only have a shell, use the bundled client:
+
+```bash
+./cli/desktop-act which
+./cli/desktop-act status
+./cli/desktop-act run --goal "Open a browser and go to example.com" --timeout 180
+```
+
+It speaks JSON-RPC over stdio to the same server. Paths resolve from
+`DESKTOP_ACT_COMMAND` / `DESKTOP_ACT_HOME`, this checkout, or the per-user
+cache — nothing host-specific is hard-coded. See [cli/README.md](./cli/README.md).
+
+**Note:** `act()` takes `max_iterations` (and `timeout_seconds`), not `max_steps`.
+
 ### Watching live
 
 Every desktop session returns a `novnc_url`. Open it in any browser:
@@ -197,6 +213,10 @@ desktop-act/
 ├── .claude-plugin/plugin.json     # plugin manifest (registers MCP server)
 ├── commands/act.md                # /desktop:act slash command
 ├── skills/desktop-act/SKILL.md    # when-to-use skill doc
+├── cli/
+│   ├── desktop-act                # shell entrypoint
+│   ├── desktop_act_cli.py         # stdio JSON-RPC client
+│   └── README.md                  # CLI usage
 ├── mcp-server/
 │   ├── run.sh                     # launcher (auto-bootstraps venv)
 │   └── server.py                  # FastMCP server (single file)

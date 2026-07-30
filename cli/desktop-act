@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Portable entrypoint for the desktop-act stdio CLI.
+# Resolves the Python next to this repo (venv if present), else system python3.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VENV_PY="${DESKTOP_ACT_VENV:-$ROOT/.venv}/bin/python"
+if [[ -x "$VENV_PY" ]]; then
+  exec "$VENV_PY" "$ROOT/cli/desktop_act_cli.py" "$@"
+fi
+exec "${DESKTOP_ACT_PYTHON:-python3}" "$ROOT/cli/desktop_act_cli.py" "$@"
