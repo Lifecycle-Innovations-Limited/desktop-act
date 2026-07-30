@@ -1,10 +1,24 @@
 {
   "name": "desktop-act",
   "version": "0.2.0",
-  "description": "Single 'do what I mean' entrypoint for agentic browsing + desktop automation. Wraps Kapture, claude-in-chrome, chrome-devtools-mcp, Playwright, patchright, and python-xlib behind one LLM-routed tool.",
+  "description": "Computer-use primitives + multi-desktop pool + autonomous act() loop. Screenshot, click, type, keypress, scroll, launch_app over platform backends (X11/Xvnc, macOS, Windows). Auth via claude-agent-sdk OAuth \u2014 no API key required.",
   "author": {
-    "name": "Sam Renders"
+    "name": "Lifecycle Innovations Limited",
+    "url": "https://github.com/Lifecycle-Innovations-Limited"
   },
+  "homepage": "https://github.com/Lifecycle-Innovations-Limited/desktop-act",
+  "repository": "https://github.com/Lifecycle-Innovations-Limited/desktop-act",
+  "license": "MIT",
+  "keywords": [
+    "computer-use",
+    "desktop",
+    "automation",
+    "mcp",
+    "fastmcp",
+    "x11",
+    "vnc",
+    "screenshot"
+  ],
   "skills": [
     "skills/desktop-act"
   ],
