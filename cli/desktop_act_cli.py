@@ -107,11 +107,13 @@ class McpClient:
         merged = os.environ.copy()
         if env:
             merged.update(env)
+        # Inherit stderr so server INFO logs do not fill a PIPE and deadlock act/run.
+        # stdout stays piped for JSON-RPC; stderr is diagnostic only.
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=None,
             text=True,
             env=merged,
             bufsize=1,
@@ -135,13 +137,11 @@ class McpClient:
         while time.time() < deadline:
             line = self.proc.stdout.readline()
             if not line:
-                err = ""
-                if self.proc.stderr:
-                    try:
-                        err = self.proc.stderr.read(400)
-                    except Exception:
-                        pass
-                raise RuntimeError(f"MCP EOF while waiting for {method}: {err}")
+                rc = self.proc.poll()
+                raise RuntimeError(
+                    f"MCP EOF while waiting for {method}"
+                    + (f" (exit {rc})" if rc is not None else "")
+                )
             line = line.strip()
             if not line.startswith("{"):
                 continue
@@ -222,7 +222,11 @@ def _client_from_args(args: argparse.Namespace) -> McpClient:
         env.setdefault("DESKTOP_ACT_DISPLAY", args.display)
     timeout = float(getattr(args, "rpc_timeout", 120) or 120)
     client = McpClient(cmd, env=env or None, timeout=timeout)
-    client.initialize()
+    try:
+        client.initialize()
+    except Exception:
+        client.close()
+        raise
     return client
 
 
