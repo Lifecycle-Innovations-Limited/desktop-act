@@ -2102,7 +2102,7 @@ async def act(
     goal: str,
     max_iterations: int = 20,
     timeout_seconds: int = 600,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-sonnet-5",
     session_id: str = "",
 ) -> dict:
     """Autonomous goal execution via claude-agent-sdk (CLI OAuth, no API key).
@@ -2111,7 +2111,7 @@ async def act(
       goal: natural-language objective.
       max_iterations: turn cap for the inner loop.
       timeout_seconds: hard wall-clock cap.
-      model: model id for the inner agent.
+      model: model id for the inner agent (default: Claude Sonnet 5).
       session_id: target a specific pool session (empty → default desktop).
     """
     run_id = uuid.uuid4().hex[:10]
