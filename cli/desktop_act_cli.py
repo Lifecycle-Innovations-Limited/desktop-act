@@ -386,7 +386,7 @@ def cmd_act(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Acquire → act(goal) → release. Exit 0 only if act reports ok."""
+    """Acquire -> act(goal) -> release. Exit 0 only if act reports ok."""
     if not args.goal:
         print("error: --goal required", file=sys.stderr)
         return 2
@@ -608,7 +608,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "run",
-        help="Ensure desktop → screenshot → act(goal) → release (one-shot goal loop)",
+        help="Ensure desktop -> screenshot -> act(goal) -> release (one-shot goal loop)",
     )
     _add_common(p)
     _add_session(p)
