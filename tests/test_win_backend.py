@@ -145,9 +145,64 @@ def test_backend_dispatch_names():
         assert isinstance(mod.BACKEND, mod.WinBackend)
 
 
+def test_winbackend_take_screenshot_calls_encode_screenshot_correctly():
+    """Regression: WinBackend._take_screenshot must pass display+grab_ms to _encode_screenshot."""
+    wb = mod.WinBackend()
+
+    # Mock a 10x20 RGB image and a stable screen size.
+    class FakeImg:
+        mode = "RGB"
+        width = 10
+        height = 20
+
+        def tobytes(self):
+            return b"\x00" * (10 * 20 * 3)
+
+    calls = []
+
+    def fake_encode(img, display, grab_ms, fmt, max_width, use_cache):
+        calls.append({"display": display, "grab_ms": grab_ms, "fmt": fmt, "max_width": max_width})
+        return {
+            "path": "/tmp/fake.jpg",
+            "width": 5,
+            "height": 10,
+            "sha": "abc123",
+            "cached": False,
+            "grab_ms": grab_ms,
+            "save_ms": 1,
+        }
+
+    wb._screen_size = lambda: (1920, 1080)
+    from PIL import ImageGrab
+
+    orig_encode = mod._encode_screenshot
+    orig_grab = ImageGrab.grab
+    mod._encode_screenshot = fake_encode
+    ImageGrab.grab = lambda *a, **k: FakeImg()
+    try:
+        result = wb._take_screenshot(region="", fmt="jpeg", max_width=1280, use_cache=True)
+    finally:
+        mod._encode_screenshot = orig_encode
+        ImageGrab.grab = orig_grab
+
+    assert len(calls) == 1
+    assert calls[0]["display"] == "win:main"
+    assert calls[0]["grab_ms"] >= 0
+    assert calls[0]["fmt"] == "jpeg"
+    assert calls[0]["max_width"] == 1280
+    assert result["ok"] is True
+    assert result["path"] == "/tmp/fake.jpg"
+    assert result["display"] == "win:main"
+    assert result["width"] == 5
+    assert result["height"] == 10
+    assert result["sha"] == "abc123"
+    assert result["screen"] == "1920x1080"
+
+
 if __name__ == "__main__":
     test_winbackend_class_exists_with_full_surface()
     test_winbackend_primitives_guard_off_windows()
     test_winbackend_leases_on_any_platform()
     test_backend_dispatch_names()
+    test_winbackend_take_screenshot_calls_encode_screenshot_correctly()
     print("ok")

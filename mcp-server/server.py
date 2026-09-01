@@ -1706,17 +1706,18 @@ class WinBackend:
                 x, y, w, h = parts
                 bbox = (x, y, x + w, y + h)
         img = ImageGrab.grab(bbox=bbox, all_screens=True)
-        path, meta = _encode_screenshot(img, fmt=fmt, max_width=max_width, use_cache=use_cache)
+        grab_ms = int((time.time() - t0) * 1000)
+        r = _encode_screenshot(img, "win:main", grab_ms, fmt, max_width, use_cache)
         w, h = self._screen_size()
         return {
             "ok": True,
-            "path": str(path),
+            "path": str(r["path"]),
             "display": "win:main",
-            "width": meta.get("width") or img.width,
-            "height": meta.get("height") or img.height,
+            "width": r["width"],
+            "height": r["height"],
             "screen": f"{w}x{h}",
-            "sha": meta.get("sha"),
-            "cached": meta.get("cached", False),
+            "sha": r["sha"],
+            "cached": r["cached"],
             "ms": int((time.time() - t0) * 1000),
         }
 
