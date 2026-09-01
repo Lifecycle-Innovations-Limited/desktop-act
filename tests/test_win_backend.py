@@ -173,12 +173,17 @@ def test_winbackend_take_screenshot_calls_encode_screenshot_correctly():
         }
 
     wb._screen_size = lambda: (1920, 1080)
-    orig = mod._encode_screenshot
+    from PIL import ImageGrab
+
+    orig_encode = mod._encode_screenshot
+    orig_grab = ImageGrab.grab
     mod._encode_screenshot = fake_encode
+    ImageGrab.grab = lambda *a, **k: FakeImg()
     try:
         result = wb._take_screenshot(region="", fmt="jpeg", max_width=1280, use_cache=True)
     finally:
-        mod._encode_screenshot = orig
+        mod._encode_screenshot = orig_encode
+        ImageGrab.grab = orig_grab
 
     assert len(calls) == 1
     assert calls[0]["display"] == "win:main"
