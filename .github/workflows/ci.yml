@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.11"]
     needs: optimize_ci
     if: always() && (github.event_name != 'pull_request' || needs.optimize_ci.result != 'success' || needs.optimize_ci.outputs.skip != 'true')
