@@ -110,3 +110,27 @@ jobs:
           test "$SID_A" != "$SID_B"
           ./cli/desktop-act release --session-id "$SID_A"
           ./cli/desktop-act release --session-id "$SID_B"
+
+  # Aggregator job. Name MUST stay exactly "CI Summary".
+  # Informational for now: this PR does not change rulesets or required checks.
+  # Fails if any needed job failed or was cancelled. A needed job that was
+  # skipped (path-gated or Graphite optimizer skip) is treated as passing.
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [optimize_ci, lint-test, e2e-linux-pool]
+    if: always()
+    steps:
+      - name: Evaluate needed job results
+        env:
+          NEEDS_RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "needed job results: $NEEDS_RESULTS"
+          for r in $NEEDS_RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::CI Summary: a needed job finished as '$r'"; exit 1 ;;
+            esac
+          done
+          echo "CI Summary: all needed jobs succeeded or were skipped"
