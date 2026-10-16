@@ -119,6 +119,7 @@ jobs:
     name: CI Summary
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions: {}
     needs: [optimize_ci, lint-test, e2e-linux-pool]
     if: always()
     steps:
