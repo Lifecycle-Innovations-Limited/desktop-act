@@ -10,8 +10,8 @@ mcp==1.30.0
 pillow==12.3.0
 pydantic==2.14.3
 pydantic-settings==2.16.2
-# pydantic 2.13.4 pins pydantic-core==2.50.4 exactly.
-pydantic_core==2.46.4
+# pydantic 2.14.3 pins pydantic-core==2.50.4 exactly.
+pydantic_core==2.50.4
 # Linux-only: X11 primitives. On macOS the MacBackend uses system binaries
 # (screencapture, cliclick, osascript, open) and never imports Xlib.
 python-xlib==0.33; sys_platform == "linux"
